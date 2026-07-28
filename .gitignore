@@ -145,4 +145,5 @@ results
 T_perturb/results
 log
 tokenized_data/
-final_figs/
+final_figs/miniforge.sh
+*.ckpt
