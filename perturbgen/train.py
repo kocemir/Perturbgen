@@ -14,6 +14,7 @@ from pytorch_lightning.strategies import DDPStrategy, DeepSpeedStrategy
 
 from perturbgen.configs import ROOT
 from perturbgen.Dataloaders.datamodule import PerturbGenDataModule
+from perturbgen.Model.jepa_trainer import JEPADecoderTrainer, JEPATrainer
 from perturbgen.Model.trainer import CountDecoderTrainer, PerturbGenTrainer
 from perturbgen.src.utils import (
     condition_for_count_loss,
@@ -63,7 +64,38 @@ def get_args(args=None):
         '--train_mode',
         type=str,
         default='masking',
-        help='Mode [masking, count]',
+        help='Mode [masking, count, jepa, jepa_decoder]',
+    )
+    parser.add_argument(
+        '--ema_decay',
+        type=float,
+        default=0.996,
+        help='EMA decay for JEPA target encoder',
+    )
+    parser.add_argument(
+        '--jepa_loss',
+        type=str,
+        default='mse',
+        choices=['mse', 'smooth_l1'],
+        help='Latent loss for JEPA training',
+    )
+    parser.add_argument(
+        '--normalize_latents',
+        type=str2bool,
+        default=True,
+        help='L2-normalize JEPA latents before loss',
+    )
+    parser.add_argument(
+        '--ckpt_jepa_path',
+        type=str,
+        default=None,
+        help='JEPA checkpoint for jepa_decoder fine-tuning',
+    )
+    parser.add_argument(
+        '--freeze_jepa',
+        type=str2bool,
+        default=True,
+        help='Freeze JEPA backbone when training jepa_decoder',
     )
     parser.add_argument(
         '--parallel_distribution',
@@ -419,6 +451,8 @@ def main(argv=None) -> None:
 
     # ZINB count loss preprocessing
     # ----------------------------------------------------------------------------------
+    conditions = condition_encodings = conditions_combined = None
+    conditions_ = condition_keys_ = conditions_combined_ = None
     if args.train_mode == 'count':
         (
             conditions,
@@ -498,8 +532,32 @@ def main(argv=None) -> None:
         trainer_kwargs['n_genes'] = src_adata.shape[1]
         trainer_kwargs['dropout'] = args.count_dropout
         decoder_module = CountDecoderTrainer(**trainer_kwargs)
+    elif args.train_mode == 'jepa':
+        trainer_kwargs['dropout'] = args.cellgen_dropout
+        trainer_kwargs['lr'] = args.cellgen_lr
+        trainer_kwargs['weight_decay'] = args.cellgen_wd
+        trainer_kwargs['ema_decay'] = args.ema_decay
+        trainer_kwargs['normalize_latents'] = args.normalize_latents
+        trainer_kwargs['loss_type'] = args.jepa_loss
+        trainer_kwargs['ckpt_masking_path'] = args.ckpt_masking_path
+        trainer_kwargs['var_list'] = args.var_list
+        pretrained_module = JEPATrainer(**trainer_kwargs)
+    elif args.train_mode == 'jepa_decoder':
+        trainer_kwargs['dropout'] = args.count_dropout
+        trainer_kwargs['lr'] = args.count_lr
+        trainer_kwargs['weight_decay'] = args.count_wd
+        trainer_kwargs['ema_decay'] = args.ema_decay
+        trainer_kwargs['normalize_latents'] = args.normalize_latents
+        trainer_kwargs['ckpt_masking_path'] = args.ckpt_masking_path
+        trainer_kwargs['ckpt_jepa_path'] = args.ckpt_jepa_path
+        trainer_kwargs['freeze_jepa'] = args.freeze_jepa
+        trainer_kwargs['n_genes'] = src_adata.shape[1]
+        decoder_module = JEPADecoderTrainer(**trainer_kwargs)
     else:
-        raise ValueError('train_mode not recognised, needs to be masking or count')
+        raise ValueError(
+            'train_mode not recognised, needs to be '
+            'masking, count, jepa, or jepa_decoder'
+        )
     # Initialize data module
     # ----------------------------------------------------------------------------------
 
@@ -533,7 +591,7 @@ def main(argv=None) -> None:
         'sampling_keys': args.sampling_keys,
         'seed': 42, # fix seed for shuffling for reproducibility
     }
-    if args.train_mode == 'masking':
+    if args.train_mode in ('masking', 'jepa'):
         # TODO: Do not pass src into DataModule
         data_module = PerturbGenDataModule(**data_module_kwargs)
 
@@ -545,6 +603,15 @@ def main(argv=None) -> None:
         data_module_kwargs['conditions'] = conditions
         data_module_kwargs['conditions_combined'] = conditions_combined
         data_module = PerturbGenDataModule(**data_module_kwargs)
+    elif args.train_mode == 'jepa_decoder':
+        data_module_kwargs['src_counts'] = src_counts
+        data_module_kwargs['tgt_counts_dict'] = tgt_counts_dict
+        data_module = PerturbGenDataModule(**data_module_kwargs)
+    else:
+        raise ValueError(
+            'train_mode not recognised for datamodule: '
+            f'{args.train_mode}'
+        )
     # Setup trainer
     # ----------------------------------------------------------------------------------
     run_id = datetime.now().strftime('%Y%m%d_%H%M_cellgen')
@@ -582,6 +649,27 @@ def main(argv=None) -> None:
         else:
             monitor_metric = 'train/mse'
             mode = 'min'
+    elif args.train_mode == 'jepa':
+        filename = (
+            f'{run_id}_train_{args.train_mode}_lr_{args.cellgen_lr}'
+            f'_wd_{args.cellgen_wd}_batch_{args.batch_size}_'
+            f'ema_{args.ema_decay}_p{args.pos_encoding_mode}'
+            f'_tp_{time_steps_str}_s_{args.seed}'
+        )
+        monitor_metric = (
+            'val/jepa_loss' if val_indices is not None else 'train/jepa_loss'
+        )
+        mode = 'min'
+    elif args.train_mode == 'jepa_decoder':
+        filename = (
+            f'{run_id}_train_{args.train_mode}_lr_{args.count_lr}'
+            f'_wd_{args.count_wd}_batch_{args.batch_size}_'
+            f'tp_{time_steps_str}_s_{args.seed}'
+        )
+        monitor_metric = 'val/mse' if val_indices else 'train/mse'
+        mode = 'min'
+    else:
+        raise ValueError(f'Unknown train_mode for checkpoint naming: {args.train_mode}')
 
     checkpoint_path = os.path.join(args.output_dir, 'checkpoints')
     checkpoint_callback = ModelCheckpoint(
@@ -672,10 +760,17 @@ def main(argv=None) -> None:
                 )
         else:
             trainer.fit(pretrained_module, data_module)
-    elif args.train_mode == 'count':
+    elif args.train_mode == 'jepa':
+        # Token embeddings may be warm-started inside JEPATrainer from
+        # --ckpt_masking_path; do not PL-resume unless path is a JEPA ckpt.
+        trainer.fit(pretrained_module, data_module)
+    elif args.train_mode in ('count', 'jepa_decoder'):
         trainer.fit(decoder_module, data_module)
     else:
-        raise ValueError('train_mode not recognised, needs to be masking or count')
+        raise ValueError(
+            'train_mode not recognised, needs to be '
+            'masking, count, jepa, or jepa_decoder'
+        )
 
 if __name__ == '__main__':
     main()

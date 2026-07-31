@@ -15,3 +15,5 @@ They are intended as practical example references, and assume familiarity with P
    examples/05_GeneProgram_Discovery
    examples/06_perturbation
    examples/07_PostPerturbation_Analyses
+   jepa_research_plan
+   examples/08_train_jepa

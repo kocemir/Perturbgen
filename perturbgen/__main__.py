@@ -37,7 +37,18 @@ class OrderedGroup(click.Group):
         return ordered_names + other_names
 
 
-@click.group(cls=OrderedGroup, order=["tokenise", "train-mask", "train-decoder", "extract-embedding"])
+@click.group(
+    cls=OrderedGroup,
+    order=[
+        "tokenise",
+        "train-mask",
+        "train-decoder",
+        "train-jepa",
+        "train-jepa-decoder",
+        "extract-embedding",
+        "eval-jepa",
+    ],
+)
 def main():
     pass
 
@@ -81,6 +92,52 @@ def extract_embedding(args):
     """Load checkpoint and extract the embeddings."""
     click.echo("loading, please wait...")
     from perturbgen.val import main
+    main(args)
+
+
+@main.command(
+    context_settings={"ignore_unknown_options": True, "help_option_names": []},
+    name="train-jepa",
+)
+@click.argument("args", nargs=-1)
+def train_jepa(args):
+    """Train cell-trajectory JEPA (Phase A)."""
+    click.echo("loading, please wait...")
+    from perturbgen.train import main
+
+    # Ensure train_mode=jepa unless the user already set it.
+    forwarded = list(args)
+    if "--train_mode" not in forwarded:
+        forwarded = ["--train_mode", "jepa", *forwarded]
+    main(forwarded)
+
+
+@main.command(
+    context_settings={"ignore_unknown_options": True, "help_option_names": []},
+    name="train-jepa-decoder",
+)
+@click.argument("args", nargs=-1)
+def train_jepa_decoder(args):
+    """Train JEPA count decoder (Phase D)."""
+    click.echo("loading, please wait...")
+    from perturbgen.train import main
+
+    forwarded = list(args)
+    if "--train_mode" not in forwarded:
+        forwarded = ["--train_mode", "jepa_decoder", *forwarded]
+    main(forwarded)
+
+
+@main.command(
+    context_settings={"ignore_unknown_options": True, "help_option_names": []},
+    name="eval-jepa",
+)
+@click.argument("args", nargs=-1)
+def eval_jepa(args):
+    """Run JEPA research eval phases B–F."""
+    click.echo("loading, please wait...")
+    from perturbgen.jepa_eval import main
+
     main(args)
 
 

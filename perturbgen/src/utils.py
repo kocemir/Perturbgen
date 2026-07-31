@@ -1040,6 +1040,35 @@ def modify_ckpt_state_dict(
     return new_state_dict
 
 
+def remap_state_dict_for_compiled_model(state_dict, model_state_dict):
+    """Map checkpoint keys onto a torch.compile'd module.
+
+    Checkpoints are saved with ``_orig_mod`` stripped (see
+    ``on_save_checkpoint``). Loading into a compiled model requires
+    re-inserting ``_orig_mod`` so key names match
+    ``OptimizedModule`` wrappers.
+    """
+    model_keys = set(model_state_dict.keys())
+    remapped = {}
+    for key, value in state_dict.items():
+        if key in model_keys:
+            remapped[key] = value
+            continue
+        stripped = key.replace('._orig_mod.', '.')
+        if stripped in model_keys:
+            remapped[stripped] = value
+            continue
+        parts = key.split('.')
+        mapped = None
+        for i in range(len(parts)):
+            candidate = '.'.join(parts[:i] + ['_orig_mod'] + parts[i:])
+            if candidate in model_keys:
+                mapped = candidate
+                break
+        remapped[mapped if mapped is not None else key] = value
+    return remapped
+
+
 def pearson(
     pred_counts: torch.Tensor,
     true_counts: torch.Tensor,

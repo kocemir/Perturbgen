@@ -98,6 +98,19 @@ For usage, see the [documentation](https://perturbgen.cog.sanger.ac.uk/docs/exam
 - [Gene Program Discovery](docs/examples/05_GeneProgram_Discovery.ipynb)
 - [Perturbation](docs/examples/06_perturbation.ipynb)
 - [Post Perturbation Analyses](docs/examples/07_PostPerturbation_Analyses.ipynb)
+- [Train Cell-Trajectory JEPA](docs/examples/08_train_jepa.ipynb) (research replacement path)
+
+**JEPA research plan:** see [docs/jepa_research_plan.md](docs/jepa_research_plan.md) for goals, architecture, phases A–F, isolation rules, and the Phase A warm-start runbook.
+
+JEPA CLI (parallel to MaskGIT training; keep outputs under `res/jepa`):
+
+```shell
+python -m perturbgen train-jepa --train_mode jepa ...
+python -m perturbgen train-jepa-decoder --train_mode jepa_decoder ...
+python -m perturbgen eval-jepa --phase all --jepa_embeddings path/to/jepa_cell_embeddings.pt
+```
+
+Or use `docs/examples/run_train_jepa_sod2.sh`.
 
 See Perturbation notebook for more explaination about how to perturb a gene or list of genes
 

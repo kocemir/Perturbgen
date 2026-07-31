@@ -39,6 +39,7 @@ from perturbgen.src.utils import (  # WarmupScheduler
     concat_cond_tokens,
     exclude_special_tokens,
     modify_ckpt_state_dict,
+    remap_state_dict_for_compiled_model,
     return_attn_weights,
     return_gene_embeddings,
     return_generation_adata,
@@ -577,6 +578,15 @@ class PerturbGenTrainer(LightningModule):
             k.replace('._orig_mod.', '.'): v
             for k, v in checkpoint['state_dict'].items()
         }
+
+    def on_load_checkpoint(self, checkpoint):
+        # Reverse of on_save_checkpoint: re-insert _orig_mod for compiled modules.
+        if 'state_dict' not in checkpoint:
+            return
+        checkpoint['state_dict'] = remap_state_dict_for_compiled_model(
+            checkpoint['state_dict'],
+            self.state_dict(),
+        )
 
 
 class CountDecoderTrainer(LightningModule):
@@ -1301,3 +1311,11 @@ class CountDecoderTrainer(LightningModule):
             k.replace('._orig_mod.', '.'): v
             for k, v in checkpoint['state_dict'].items()
         }
+
+    def on_load_checkpoint(self, checkpoint):
+        if 'state_dict' not in checkpoint:
+            return
+        checkpoint['state_dict'] = remap_state_dict_for_compiled_model(
+            checkpoint['state_dict'],
+            self.state_dict(),
+        )

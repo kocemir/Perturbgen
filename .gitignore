@@ -147,3 +147,7 @@ log
 tokenized_data/
 final_figs/miniforge.sh
 *.ckpt
+*.h5ad
+docs/examples/Raw_h5ad
+docs/examples/Raw.h5ad
+.vscode/
