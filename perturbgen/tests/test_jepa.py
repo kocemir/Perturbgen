@@ -27,9 +27,18 @@ from perturbgen.src.jepa_metrics import (
     trajectory_baselines,
 )
 from perturbgen.jepa_eval import phase_b, phase_c, phase_d, phase_e, phase_f
+from perturbgen.src.jepa_token_maps import apply_id_lookup, build_lookup_tables
 
 
 class TestJEPAModules(unittest.TestCase):
+    def test_id_lookup_tables(self):
+        g2l, l2g = build_lookup_tables({9: 4, 10: 5})
+        ids = torch.tensor([[9, 10, 0]])
+        local = apply_id_lookup(ids, g2l)
+        self.assertTrue(torch.equal(local, torch.tensor([[4, 5, 0]])))
+        back = apply_id_lookup(local, l2g)
+        self.assertTrue(torch.equal(back, torch.tensor([[9, 10, 0]])))
+
     def test_mean_pool_tokens(self):
         embs = torch.tensor(
             [[[1.0, 1.0], [3.0, 3.0], [0.0, 0.0]]], dtype=torch.float32
@@ -65,6 +74,7 @@ class TestJEPAModules(unittest.TestCase):
             n_total_tps=3,
             pred_tps=[1, 2],
             ema_decay=0.5,
+            encoder_type='cell',
         )
         src = torch.randint(2, 60, (4, 8))
         tgt = {
@@ -105,6 +115,7 @@ class TestJEPATrainerTrainability(unittest.TestCase):
             n_total_tps=2,
             lr=1e-2,
             ema_decay=0.9,
+            jepa_encoder='cell',
             output_dir=tempfile.mkdtemp(),
         )
         batch = {
@@ -141,6 +152,7 @@ class TestJEPADecoderAndEval(unittest.TestCase):
             max_seq_length=12,
             n_total_tps=2,
             pred_tps=[1],
+            encoder_type='cell',
         )
         dec = JEPACountDecoder(jepa, n_genes=20, d_model=16, freeze_jepa=True)
         src = torch.randint(2, 60, (3, 6))
@@ -159,6 +171,7 @@ class TestJEPADecoderAndEval(unittest.TestCase):
             pred_tps=[1],
             n_total_tps=1,
             n_genes=20,
+            jepa_encoder='cell',
             output_dir=tempfile.mkdtemp(),
         )
         batch = {

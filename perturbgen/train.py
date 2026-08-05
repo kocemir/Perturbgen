@@ -9,7 +9,8 @@ import torch
 from datasets import concatenate_datasets, load_from_disk
 
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
-from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger, WandbLogger
+from pytorch_lightning.plugins.environments import LightningEnvironment
 from pytorch_lightning.strategies import DDPStrategy, DeepSpeedStrategy
 
 from perturbgen.configs import ROOT
@@ -76,8 +77,27 @@ def get_args(args=None):
         '--jepa_loss',
         type=str,
         default='mse',
-        choices=['mse', 'smooth_l1'],
-        help='Latent loss for JEPA training',
+        choices=['mse', 'smooth_l1', 'cosine'],
+        help='Latent loss for JEPA training: mse | smooth_l1 | cosine '
+        '(cosine minimizes 1-cos, i.e. maximizes cosine similarity)',
+    )
+    parser.add_argument(
+        '--vicreg_var_coeff',
+        type=float,
+        default=0.0,
+        help='VICReg variance coefficient (0 disables); anti-collapse regularizer',
+    )
+    parser.add_argument(
+        '--vicreg_cov_coeff',
+        type=float,
+        default=0.0,
+        help='VICReg covariance coefficient (0 disables); decorrelates dims',
+    )
+    parser.add_argument(
+        '--vicreg_gamma',
+        type=float,
+        default=None,
+        help='VICReg variance target std; default 1/sqrt(D) if normalize_latents else 1',
     )
     parser.add_argument(
         '--normalize_latents',
@@ -96,6 +116,31 @@ def get_args(args=None):
         type=str2bool,
         default=True,
         help='Freeze JEPA backbone when training jepa_decoder',
+    )
+    parser.add_argument(
+        '--jepa_encoder',
+        type=str,
+        default='scmaskgit',
+        choices=['scmaskgit', 'cell'],
+        help=(
+            'JEPA context/target encoder: pretrained MaskGIT source encoder '
+            '(scmaskgit) or lightweight CellEncoder (cell)'
+        ),
+    )
+    parser.add_argument(
+        '--freeze_jepa_encoder',
+        type=str2bool,
+        default=False,
+        help='Freeze JEPA context encoder; train predictor (and unfrozen parts) only',
+    )
+    parser.add_argument(
+        '--jepa_encoder_layers',
+        type=int,
+        default=3,
+        help=(
+            'For jepa_encoder=scmaskgit: run only the first N pretrained '
+            'transformer blocks (early exit). Heads/width stay as in ckpt.'
+        ),
     )
     parser.add_argument(
         '--parallel_distribution',
@@ -219,6 +264,12 @@ def get_args(args=None):
     parser.add_argument('--count_wd', type=float, default=0.01, help='weight decay')
     parser.add_argument(
         '--num_layers', type=int, default=6, help='number of decoder layers'
+    )
+    parser.add_argument(
+        '--num_heads',
+        type=int,
+        default=8,
+        help='number of attention heads (CellEncoder / JEPA transformer)',
     )
     parser.add_argument('--d_ff', type=int, default=64, help='feed forward dimension')
     parser.add_argument('--mlm_prob', type=float, default=0.15, help='mlm probability')
@@ -490,7 +541,7 @@ def main(argv=None) -> None:
     trainer_kwargs = {
         'tgt_vocab_size': max_tgt_input_id + 50,  # add 50 for extra tokens
         'd_model': args.d_model,
-        'num_heads': 8,
+        'num_heads': args.num_heads,
         'num_layers': args.num_layers,
         'd_ff': args.d_ff,
         'max_seq_length': max_len + 100,
@@ -539,7 +590,13 @@ def main(argv=None) -> None:
         trainer_kwargs['ema_decay'] = args.ema_decay
         trainer_kwargs['normalize_latents'] = args.normalize_latents
         trainer_kwargs['loss_type'] = args.jepa_loss
+        trainer_kwargs['vicreg_var_coeff'] = args.vicreg_var_coeff
+        trainer_kwargs['vicreg_cov_coeff'] = args.vicreg_cov_coeff
+        trainer_kwargs['vicreg_gamma'] = args.vicreg_gamma
         trainer_kwargs['ckpt_masking_path'] = args.ckpt_masking_path
+        trainer_kwargs['jepa_encoder'] = args.jepa_encoder
+        trainer_kwargs['freeze_jepa_encoder'] = args.freeze_jepa_encoder
+        trainer_kwargs['jepa_encoder_layers'] = args.jepa_encoder_layers
         trainer_kwargs['var_list'] = args.var_list
         pretrained_module = JEPATrainer(**trainer_kwargs)
     elif args.train_mode == 'jepa_decoder':
@@ -551,6 +608,9 @@ def main(argv=None) -> None:
         trainer_kwargs['ckpt_masking_path'] = args.ckpt_masking_path
         trainer_kwargs['ckpt_jepa_path'] = args.ckpt_jepa_path
         trainer_kwargs['freeze_jepa'] = args.freeze_jepa
+        trainer_kwargs['jepa_encoder'] = args.jepa_encoder
+        trainer_kwargs['freeze_jepa_encoder'] = args.freeze_jepa_encoder
+        trainer_kwargs['jepa_encoder_layers'] = args.jepa_encoder_layers
         trainer_kwargs['n_genes'] = src_adata.shape[1]
         decoder_module = JEPADecoderTrainer(**trainer_kwargs)
     else:
@@ -650,10 +710,24 @@ def main(argv=None) -> None:
             monitor_metric = 'train/mse'
             mode = 'min'
     elif args.train_mode == 'jepa':
+        # Encode optional JEPA choices so runs are distinguishable on disk.
+        enc_tag = f'enc_{args.jepa_encoder}'
+        if args.jepa_encoder == 'scmaskgit':
+            enc_tag += f'_L{args.jepa_encoder_layers}'
+        freeze_tag = 'fz' if args.freeze_jepa_encoder else 'unfz'
+        opt_tags = [f'loss_{args.jepa_loss}']
+        if args.vicreg_var_coeff and args.vicreg_var_coeff > 0:
+            opt_tags.append(f'vicv_{args.vicreg_var_coeff:g}')
+        if args.vicreg_cov_coeff and args.vicreg_cov_coeff > 0:
+            opt_tags.append(f'vicc_{args.vicreg_cov_coeff:g}')
+        if not args.normalize_latents:
+            opt_tags.append('unnorm')
+        opt_suffix = '_'.join(opt_tags)
         filename = (
             f'{run_id}_train_{args.train_mode}_lr_{args.cellgen_lr}'
             f'_wd_{args.cellgen_wd}_batch_{args.batch_size}_'
-            f'ema_{args.ema_decay}_p{args.pos_encoding_mode}'
+            f'{enc_tag}_{freeze_tag}_{opt_suffix}'
+            f'_ema_{args.ema_decay}_p{args.pos_encoding_mode}'
             f'_tp_{time_steps_str}_s_{args.seed}'
         )
         monitor_metric = (
@@ -661,9 +735,15 @@ def main(argv=None) -> None:
         )
         mode = 'min'
     elif args.train_mode == 'jepa_decoder':
+        enc_tag = f'enc_{args.jepa_encoder}'
+        if args.jepa_encoder == 'scmaskgit':
+            enc_tag += f'_L{args.jepa_encoder_layers}'
+        fz_enc = 'fzenc' if args.freeze_jepa_encoder else 'unfzenc'
+        fz_jepa = 'fzjepa' if args.freeze_jepa else 'unfzjepa'
         filename = (
             f'{run_id}_train_{args.train_mode}_lr_{args.count_lr}'
             f'_wd_{args.count_wd}_batch_{args.batch_size}_'
+            f'{enc_tag}_{fz_enc}_{fz_jepa}_'
             f'tp_{time_steps_str}_s_{args.seed}'
         )
         monitor_metric = 'val/mse' if val_indices else 'train/mse'
@@ -672,28 +752,45 @@ def main(argv=None) -> None:
         raise ValueError(f'Unknown train_mode for checkpoint naming: {args.train_mode}')
 
     checkpoint_path = os.path.join(args.output_dir, 'checkpoints')
+    # JEPA: one folder per hyperparam recipe so optional choices are visible
+    # when browsing (enc/freeze/loss/bs/...), not only in the .ckpt name.
+    if args.train_mode in ('jepa', 'jepa_decoder'):
+        checkpoint_path = os.path.join(checkpoint_path, filename)
+        ckpt_filename = '{epoch:02d}'
+    else:
+        ckpt_filename = f'{filename}-' + '{epoch:02d}'
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpoint_path,
-        filename=f'{filename}-' + '{epoch:02d}',
+        filename=ckpt_filename,
         save_top_k=-1,
         every_n_epochs=args.ckpt_every_n_epochs,
         verbose=True,
         monitor=monitor_metric,
         mode=mode,
     )
-    # The tensorboard logger allows for monitoring the progress of training
-    # Configure WandbLogger with unique name for each run
+    # Loggers: WandB (optional cloud) + CSV/TB for local loss curves without sync.
     run_name = (
         f'{run_id}_{str(uuid.uuid4())[:6]}' if torch.cuda.device_count() > 1 else run_id
     )
-    wandb_logger = WandbLogger(
-        entity=args.wandb_entity,
-        project=args.wandb_project,
-        name=run_name,
-        save_dir=args.log_dir,
-        log_model=False,
-        mode=args.wandb_mode,
-    )
+    csv_logger = CSVLogger(save_dir=args.log_dir, name=run_id)
+    tb_logger = TensorBoardLogger(save_dir=args.log_dir, name=run_id)
+    loggers = [csv_logger, tb_logger]
+    # WandB offline can hang on headless hosts (X11 "No protocol specified").
+    # Keep CSV/TB as the reliable local loggers; only attach WandB when enabled.
+    if args.wandb_mode != 'disabled':
+        loggers.insert(
+            0,
+            WandbLogger(
+                entity=args.wandb_entity,
+                project=args.wandb_project,
+                name=run_name,
+                save_dir=args.log_dir,
+                log_model=False,
+                mode=args.wandb_mode,
+            ),
+        )
+    print(f'CSV metrics: {csv_logger.log_dir}/metrics.csv')
+    print(f'TensorBoard: tensorboard --logdir {args.log_dir}')
 
     # In this simple example we just check if a GPU is available.
     # For training larger models in a distributed settings, this needs more care.
@@ -718,10 +815,19 @@ def main(argv=None) -> None:
             stage=2,
         )
     elif args.parallel_distribution == 'ddp':
-        parallel_comp_strategy = DDPStrategy(find_unused_parameters=False)
+        # scmaskgit-backed JEPA only uses the encode path; MaskGIT heads are unused.
+        find_unused = args.train_mode in ('jepa', 'jepa_decoder')
+        # Force Lightning's own process group — mpi4py is installed on this host
+        # and PL would otherwise pick MPIEnvironment/OpenMPI, which hangs here
+        # (orted / "No network interfaces for out-of-band communications").
+        parallel_comp_strategy = DDPStrategy(
+            find_unused_parameters=find_unused,
+            cluster_environment=LightningEnvironment(),
+            process_group_backend='nccl',
+        )
 
     trainer = pl.Trainer(
-        logger=wandb_logger,
+        logger=loggers,
         callbacks=[
             TQDMProgressBar(refresh_rate=10),
             early_stop_callback,

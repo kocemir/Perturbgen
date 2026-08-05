@@ -1,7 +1,15 @@
+#!/usr/bin/env python3
+"""JEPA data / PE EDA (2026-08-05).
+
+Sanity-check LPS src↔tgt pairing and visualize TimePosSin encodings.
+Output figure: docs/examples/jepa_eda.png (same dir as this script).
+See docs/examples/JEPA_README.md.
+"""
 from datasets import load_from_disk
 from pathlib import Path
 
 ROOT = Path("/home/stuke1/perturbgen/T_perturb/tokenized_data/LPS_all_tps_2k")
+OUT_PNG = Path(__file__).resolve().parent / "jepa_eda.png"
 src = load_from_disk(ROOT / "dataset_2000_hvg_src/normal.dataset")
 t1  = load_from_disk(ROOT / "dataset_2000_hvg_tgt/1_90m_LPS.dataset")
 t2  = load_from_disk(ROOT / "dataset_2000_hvg_tgt/2_6h_LPS.dataset")
@@ -99,3 +107,63 @@ for name, batch, lengths in [
         f"{name}: shape={tuple(batch.shape)} dtype={batch.dtype} "
         f"max_id={int(batch.max())} lengths={lengths.tolist()}"
     )
+
+
+
+import math
+import matplotlib.pyplot as plt
+import torch
+import torch.nn.functional as F
+
+def sinusoidal(length, d_model):
+    pe = torch.zeros(length, d_model)
+    position = torch.arange(0, length, dtype=torch.float).unsqueeze(1)
+    div_term = torch.exp(
+        torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model)
+    )
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    return pe  # (length, d_model)
+
+D = 768
+N_TIME = 5          # JEPA: n_time_steps+1 with n_time_steps=4
+L_SHOW = 64         # first 64 positions (full max_seq is huge)
+D_SHOW = 64         # first 64 dims (768 is hard to read)
+
+time_pe = sinusoidal(N_TIME, D)
+pos_pe = sinusoidal(2048, D)
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+# 1) time_pe heatmap
+im0 = axes[0, 0].imshow(time_pe[:, :D_SHOW].numpy(), aspect="auto", cmap="coolwarm")
+axes[0, 0].set_title(f"time_pe  shape=({N_TIME},{D})  showing [:, :{D_SHOW}]")
+axes[0, 0].set_ylabel("time index k")
+axes[0, 0].set_xlabel("dim")
+plt.colorbar(im0, ax=axes[0, 0], fraction=0.046)
+
+# 2) pos_pe heatmap
+im1 = axes[0, 1].imshow(pos_pe[:L_SHOW, :D_SHOW].numpy(), aspect="auto", cmap="coolwarm")
+axes[0, 1].set_title(f"pos_pe  showing [:{L_SHOW}, :{D_SHOW}]")
+axes[0, 1].set_ylabel("position i")
+axes[0, 1].set_xlabel("dim")
+plt.colorbar(im1, ax=axes[0, 1], fraction=0.046)
+
+# 3) time cosine similarity
+tn = F.normalize(time_pe, dim=1)
+im2 = axes[1, 0].imshow(torch.mm(tn, tn.t()).numpy(), vmin=0, vmax=1, cmap="viridis")
+axes[1, 0].set_title("cosine between time rows")
+axes[1, 0].set_xlabel("time j"); axes[1, 0].set_ylabel("time i")
+plt.colorbar(im2, ax=axes[1, 0], fraction=0.046)
+
+# 4) one dim over positions (classic PE wave)
+axes[1, 1].plot(pos_pe[:L_SHOW, 0].numpy(), label="dim 0 (sin)")
+axes[1, 1].plot(pos_pe[:L_SHOW, 1].numpy(), label="dim 1 (cos)")
+axes[1, 1].plot(pos_pe[:L_SHOW, 20].numpy(), label="dim 20")
+axes[1, 1].set_title("pos_pe waves along sequence")
+axes[1, 1].set_xlabel("position i"); axes[1, 1].legend()
+
+plt.tight_layout()
+plt.savefig(OUT_PNG, dpi=150, bbox_inches="tight")
+print("Wrote", OUT_PNG)
+plt.show()

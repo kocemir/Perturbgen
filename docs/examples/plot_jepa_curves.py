@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Plot JEPA training curves from Lightning CSV metrics (sod2 logs).
 
+Single-run helper (2026-08-01+). For fz vs unfz vs cell, prefer
+``09_compare_jepa_freeze.ipynb`` or ``compare_jepa_runs.py``.
+See ``JEPA_README.md``.
+
 Example:
   python docs/examples/plot_jepa_curves.py
   python docs/examples/plot_jepa_curves.py \\
-    --csv /mnt/sod2-project/csb4/stuke1/perturbgen/logs/20260731_1559_cellgen/version_0/metrics.csv
+    --csv /mnt/sod2-project/csb4/stuke1/perturbgen/logs/20260805_1622_cellgen/version_0/metrics.csv
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 LOG_ROOT = Path("/mnt/sod2-project/csb4/stuke1/perturbgen/logs")
-DEFAULT_CSV = LOG_ROOT / "20260731_1559_cellgen" / "version_0" / "metrics.csv"
+DEFAULT_CSV = LOG_ROOT / "20260804_1120_cellgen" / "version_0" / "metrics.csv"
 
 METRIC_COLS = (
     "train/jepa_loss_epoch",

@@ -58,7 +58,7 @@ flowchart LR
 - Paired LPS data + [`Perturbgen/perturbgen/Dataloaders/datamodule.py`](Perturbgen/perturbgen/Dataloaders/datamodule.py)
 - Train shell in [`Perturbgen/perturbgen/train.py`](Perturbgen/perturbgen/train.py) (add `train_mode=jepa`)
 - Lightning patterns from [`Perturbgen/perturbgen/Model/trainer.py`](Perturbgen/perturbgen/Model/trainer.py)
-- Pretrained masking encoder under `Perturbgen/pretraining_cohort/` or LPS fine-tuned ckpt
+- Pretrained MaskGIT / scmaskgit source encoder under `Perturbgen/pretraining_cohort/` as default JEPA encoder (`--jepa_encoder scmaskgit`); lightweight `CellEncoder` remains via `--jepa_encoder cell`
 
 **Ignore until Phase D**
 - MaskGIT iterative demask/remask (`generate_sequence` in scmaskgit / PerturbGen)

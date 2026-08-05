@@ -36,7 +36,35 @@ def pairwise_latent_mse(
 ) -> Dict[str, float]:
     mse = F.mse_loss(z_hat, z_tgt).item()
     cos = F.cosine_similarity(z_hat, z_tgt, dim=-1).mean().item()
-    return {'mse': float(mse), 'cosine': float(cos)}
+    return {
+        'mse': float(mse),
+        'cosine': float(cos),
+        'cosine_loss': float(1.0 - cos),
+    }
+
+
+def vicreg_var_cov(
+    z: torch.Tensor,
+    gamma: float = 1.0,
+    eps: float = 1e-4,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """VICReg variance + covariance (Bardes et al.), no invariance term.
+
+    Variance: hinge so each dim has std >= gamma across the batch.
+    Covariance: penalize off-diagonal entries of the batch covariance.
+    """
+    if z.ndim != 2 or z.size(0) < 2:
+        zero = z.sum() * 0.0
+        return zero, zero
+    # Center across batch (standard VICReg).
+    z_c = z - z.mean(dim=0)
+    std = torch.sqrt(z_c.var(dim=0, unbiased=False) + eps)
+    var_loss = F.relu(gamma - std).mean()
+    n, d = z_c.shape
+    cov = (z_c.T @ z_c) / max(n - 1, 1)
+    off_diag = cov.pow(2).sum() - cov.diagonal().pow(2).sum()
+    cov_loss = off_diag / d
+    return var_loss, cov_loss
 
 
 def linear_probe_accuracy(

@@ -62,12 +62,12 @@ flowchart LR
 
 | Component | Init |
 |-----------|------|
-| `token_embedding` | Copied from LPS masking checkpoint (read-only) |
-| Context / target transformer | Random (target = EMA of context) |
-| Predictor | Random |
+| Encoder (`--jepa_encoder scmaskgit`, default) | Full pretrained MaskGIT / scmaskgit source encoder from `pretraining_cohort` (EMA twin for targets) |
+| Encoder (`--jepa_encoder cell`) | Lightweight `CellEncoder`; optional token-emb warm-start from cohort ckpt; src IDs remapped via `tokenid_to_rowid` |
+| Predictor | Random time-conditioned MLP |
 | Training objective | Latent MSE / smooth-L1 — **not** MaskGIT CE |
 
-Warm-start does **not** load the MaskGIT demask loop, decoder FC, or count head. JEPA remains a separate model with a separate loss.
+scmaskgit path remaps **target** HVG IDs → global pretrain IDs so both src and tgt share the big encoder vocab. JEPA does **not** run the MaskGIT demask loop.
 
 ### Code map
 
@@ -141,8 +141,10 @@ Root: `T_perturb/tokenized_data/LPS_all_tps_2k/`
 
 ### Warm-start checkpoint (read-only)
 
+Pretrained cohort masking weights (token embeddings only; **not** the LPS fine-tuned masking run):
+
 ```text
-T_perturb/res/masking/checkpoints/20260729_1751_cellgen_train_masking_lr_0.0001_wd_0.0001_batch_64_ptime_pos_sin_m_pow_tp_1-2-3_s_0-epoch=19.ckpt
+Perturbgen/pretraining_cohort/20250709_1223_cellgen_train_masking_lr_5e-05_wd_1e-06_batch_64_ptime_pos_sin_m_pow_tp_1-2-3_s_42-epoch=00.ckpt
 ```
 
 ### Launch
@@ -157,7 +159,7 @@ Or follow [08_train_jepa.ipynb](examples/08_train_jepa.ipynb).
 
 **Recommended settings**
 
-- `CUDA_VISIBLE_DEVICES=5,6,7`
+- `CUDA_VISIBLE_DEVICES=0,1`
 - `--split True --splitting_mode stratified --split_obs cell_type_harmonized` (so `val/jepa_loss` is meaningful)
 - `--ckpt_masking_path` set (warm-start)
 - `--output_dir` → sod2 `.../T_perturb/res/jepa`
@@ -169,6 +171,12 @@ Or follow [08_train_jepa.ipynb](examples/08_train_jepa.ipynb).
 - `collapse_std_mean`, `collapse_mean_cosine`
 - `latent_cosine`
 - `val/baseline_identity_mse` vs `val/baseline_jepa_mse`
+
+**Loss curves** (no WandB sync needed)
+
+- CSV: `.../sod2/.../logs/<run_id>/version_*/metrics.csv` (plot in [08_train_jepa.ipynb](examples/08_train_jepa.ipynb))
+- TensorBoard: `tensorboard --logdir /mnt/sod2-project/csb4/stuke1/perturbgen/logs --bind_all`
+- WandB offline still written under sod2 `logs/` / `WANDB_DIR`
 
 ### After Phase A passes
 
@@ -188,7 +196,7 @@ Full MaskGIT vs JEPA representation comparison is Phase B (separate job).
 ## 6. Non-goals and FAQ
 
 **Is this scratch training?**  
-No. Phase A is locked to **warm-start** token embeddings from the masking ckpt. Scratch is a later ablation if needed.
+No. Phase A is locked to **warm-start** token embeddings from the pretrained cohort masking ckpt (not LPS-fine-tuned). Scratch or LPS-fine-tuned warm-start are later ablations if needed.
 
 **Is demask/remask part of JEPA?**  
 No. Demask/remask is MaskGIT **inference** (iterative generation). JEPA training is one forward pass + latent MSE.

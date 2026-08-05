@@ -1,12 +1,14 @@
 """Cell-trajectory JEPA backbone for PerturbGen replacement research.
 
-Kept free of scmaskgit / PerturbGen imports so JEPA can train as a thin parallel path.
+``CellEncoder`` stays free of scmaskgit imports. The pretrained MaskGIT source
+encoder lives in ``jepa_scmaskgit.py`` and is selected via
+``encoder_type='scmaskgit'``.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -173,7 +175,12 @@ class TimeConditionedPredictor(nn.Module):
 class CellTrajectoryJEPA(nn.Module):
     """JEPA: predict future cell latents from source cell latents.
 
-    Context encoder is trainable. Target encoder is an EMA copy (stop-grad).
+    Context encoder is trainable (unless frozen). Target encoder is an EMA copy
+    (stop-grad).
+
+    encoder_type:
+      - ``scmaskgit``: pretrained MaskGIT source encoder (default for LPS runs)
+      - ``cell``: lightweight ``CellEncoder`` (original JEPA scaffold)
     """
 
     def __init__(
@@ -193,34 +200,58 @@ class CellTrajectoryJEPA(nn.Module):
             'time_pos_sin', 'comb_sin', 'sin_learnt', 'time_pos_learnt'
         ] = 'time_pos_sin',
         normalize_latents: bool = True,
+        encoder_type: Literal['scmaskgit', 'cell'] = 'cell',
+        encoder_path: Optional[str] = None,
+        freeze_encoder: bool = False,
+        jepa_encoder_layers: int = 3,
     ):
         super().__init__()
         self.pred_tps = pred_tps if pred_tps is not None else [1, 2, 3]
         self.n_total_tps = n_total_tps
         self.ema_decay = ema_decay
         self.normalize_latents = normalize_latents
-        self.d_model = d_model
+        self.encoder_type = encoder_type
+        self.jepa_encoder_layers = jepa_encoder_layers
 
-        encoder_kwargs = dict(
-            vocab_size=vocab_size,
-            d_model=d_model,
-            num_heads=num_heads,
-            num_layers=num_layers,
-            d_ff=d_ff,
-            max_seq_length=max_seq_length,
-            n_time_steps=n_total_tps + 1,
-            dropout=dropout,
-            pad_token=pad_token,
-            pos_encoding_mode=pos_encoding_mode,
-        )
-        self.context_encoder = CellEncoder(**encoder_kwargs)
-        self.target_encoder = CellEncoder(**encoder_kwargs)
-        self.target_encoder.load_state_dict(self.context_encoder.state_dict())
-        for param in self.target_encoder.parameters():
-            param.requires_grad = False
+        if encoder_type == 'scmaskgit':
+            from perturbgen.Modules.jepa_scmaskgit import SCMaskGITCellEncoder
+
+            self.context_encoder = SCMaskGITCellEncoder(
+                encoder_path=encoder_path,
+                freeze=freeze_encoder,
+                n_encoder_layers=jepa_encoder_layers,
+            )
+            self.target_encoder = self.context_encoder.clone_as_ema_target()
+            self.d_model = self.context_encoder.d_model
+        elif encoder_type == 'cell':
+            encoder_kwargs = dict(
+                vocab_size=vocab_size,
+                d_model=d_model,
+                num_heads=num_heads,
+                num_layers=num_layers,
+                d_ff=d_ff,
+                max_seq_length=max_seq_length,
+                n_time_steps=n_total_tps + 1,
+                dropout=dropout,
+                pad_token=pad_token,
+                pos_encoding_mode=pos_encoding_mode,
+            )
+            self.context_encoder = CellEncoder(**encoder_kwargs)
+            self.target_encoder = CellEncoder(**encoder_kwargs)
+            self.target_encoder.load_state_dict(self.context_encoder.state_dict())
+            for param in self.target_encoder.parameters():
+                param.requires_grad = False
+            if freeze_encoder:
+                for param in self.context_encoder.parameters():
+                    param.requires_grad = False
+            self.d_model = d_model
+        else:
+            raise ValueError(
+                f"encoder_type must be 'scmaskgit' or 'cell', got {encoder_type!r}"
+            )
 
         self.predictor = TimeConditionedPredictor(
-            d_model=d_model,
+            d_model=self.d_model,
             n_time_steps=n_total_tps,
             dropout=dropout,
         )
@@ -287,12 +318,28 @@ class CellTrajectoryJEPA(nn.Module):
         return outputs
 
     def load_token_embedding_from_masking_ckpt(self, ckpt_path: str) -> List[str]:
-        """Initialize token embeddings from a PerturbGen masking checkpoint."""
+        """Warm-start token embeddings (``cell`` encoder only).
+
+        For ``scmaskgit``, the full pretrained encoder is already loaded via
+        ``encoder_path``; this is a no-op.
+        """
+        if self.encoder_type != 'cell':
+            return []
+        if not hasattr(self.context_encoder, 'token_embedding'):
+            return []
         checkpoint = torch.load(ckpt_path, map_location='cpu')
         state = modify_ckpt_state_dict(checkpoint, 'transformer.')
+        # Prefer nested scmaskgit embedding if present (global vocab).
+        weight_key = None
+        for key in (
+            'encoder_layers.model.token_embedding.weight',
+            'token_embedding.weight',
+        ):
+            if key in state:
+                weight_key = key
+                break
         loaded = []
-        weight_key = 'token_embedding.weight'
-        if weight_key in state:
+        if weight_key is not None:
             src = state[weight_key]
             dst = self.context_encoder.token_embedding.weight
             n = min(src.shape[0], dst.shape[0])
