@@ -98,9 +98,8 @@ For usage, see the [documentation](https://perturbgen.cog.sanger.ac.uk/docs/exam
 - [Gene Program Discovery](docs/examples/05_GeneProgram_Discovery.ipynb)
 - [Perturbation](docs/examples/06_perturbation.ipynb)
 - [Post Perturbation Analyses](docs/examples/07_PostPerturbation_Analyses.ipynb)
-- [Train Cell-Trajectory JEPA](docs/examples/08_train_jepa.ipynb) (research replacement path)
 
-**JEPA research plan:** see [docs/jepa_research_plan.md](docs/jepa_research_plan.md) for goals, architecture, phases A–F, isolation rules, and the Phase A warm-start runbook.
+**JEPA:** launch via [docs/examples/run_train_jepa_sod2.sh](docs/examples/run_train_jepa_sod2.sh); index [docs/examples/JEPA_README.md](docs/examples/JEPA_README.md); plan [docs/jepa_research_plan.md](docs/jepa_research_plan.md).
 
 JEPA CLI (parallel to MaskGIT training; keep outputs under `res/jepa`):
 

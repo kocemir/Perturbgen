@@ -2,8 +2,8 @@
 
 This document is the canonical write-up for the **cell-trajectory JEPA** research track: a parallel path aimed at eventually replacing PerturbGen’s MaskGIT token-prediction backbone while recovering the same scientific applications described in the project README.
 
-Practical tutorial: [Train Cell-Trajectory JEPA](examples/08_train_jepa.ipynb).  
-Launch script: [run_train_jepa_sod2.sh](examples/run_train_jepa_sod2.sh).
+Launch script: [run_train_jepa_sod2.sh](examples/run_train_jepa_sod2.sh).  
+Examples index: [JEPA_README.md](examples/JEPA_README.md).
 
 ---
 
@@ -155,8 +155,6 @@ bash docs/examples/run_train_jepa_sod2.sh
 # Ctrl+A then D to detach
 ```
 
-Or follow [08_train_jepa.ipynb](examples/08_train_jepa.ipynb).
-
 **Recommended settings**
 
 - `CUDA_VISIBLE_DEVICES=0,1`
@@ -174,9 +172,8 @@ Or follow [08_train_jepa.ipynb](examples/08_train_jepa.ipynb).
 
 **Loss curves** (no WandB sync needed)
 
-- CSV: `.../sod2/.../logs/<run_id>/version_*/metrics.csv` (plot in [08_train_jepa.ipynb](examples/08_train_jepa.ipynb))
-- TensorBoard: `tensorboard --logdir /mnt/sod2-project/csb4/stuke1/perturbgen/logs --bind_all`
-- WandB offline still written under sod2 `logs/` / `WANDB_DIR`
+- CSV: `.../sod2/.../logs/<run_id>/version_*/metrics.csv` (`plot_jepa_curves.py` / `09_compare_jepa_freeze.ipynb`)
+- TensorBoard: `bash docs/examples/run_tensorboard_jepa.sh` (or `--logdir` on sod2 `logs/`)
 
 ### After Phase A passes
 

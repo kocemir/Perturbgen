@@ -23,13 +23,11 @@ Paths:
 | File | ~Date | Why it exists |
 |------|-------|----------------|
 | `run_train_jepa_sod2.sh` | 20260801+ | **Main launch** for Phase A on sod2 (DDP, cosine+VICReg). Env: `JEPA_ENCODER`, `FREEZE_ENCODER`, `WARMSTART_TOKEN_EMB`, … |
-| `08_train_jepa.ipynb` | 20260801 | Interactive / documented train entry (paths, notes) |
-| `09_compare_jepa_freeze.ipynb` | 20260805 | Side-by-side fz vs unfz: loss, cosine, collapse, baselines, VICReg |
-| `compare_jepa_runs.py` | 20260805 | CLI numeric+plot compare (default 1120 vs 1128; pass `--runs` for 1622) |
+| `09_compare_jepa_freeze.ipynb` | 20260805 | Side-by-side kept runs: loss, cosine, collapse, baselines, VICReg |
+| `compare_jepa_runs.py` | 20260805 | CLI numeric+plot compare (default 1120 / 1128 / 1622) |
 | `run_tensorboard_jepa.sh` | 20260805 | TB on port 6007 for kept runs |
 | `plot_jepa_curves.py` | 20260801 | Single-run CSV curve plotter |
 | `jepa_eda.py` | 20260805 | Data / PE sanity checks for LPS pairing + positional encodings → `jepa_eda.png` |
-| `jepa_phase_a_overfit.py` + `run_jepa_phase_a_overfit.sh` | 20260803 | **Debug only**: tiny overfit / smoke before full-data runs |
 
 ## Docs (repo `docs/`)
 
