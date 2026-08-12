@@ -4,14 +4,61 @@ import uuid
 import warnings
 from datetime import datetime
 
+
+def _force_headless_env() -> None:
+    """Prevent X11 'No protocol specified' on headless/SSH hosts.
+
+    Primary cause here is OpenMPI/mpi4py (via Lightning MPIEnvironment.detect):
+    importing MPI starts an `orted` singleton that probes X11/GL and prints
+    'No protocol specified', then can hang. Also clear DISPLAY and force Agg.
+    """
+    os.environ.pop('DISPLAY', None)
+    os.environ.pop('WAYLAND_DISPLAY', None)
+    os.environ['MPLBACKEND'] = 'Agg'
+    os.environ.setdefault('MPLCONFIGDIR', '/tmp/matplotlib')
+    os.environ.setdefault('NUMBA_CACHE_DIR', '/tmp/numba_cache')
+    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+    os.environ.setdefault('WANDB_DISABLE_CODE', 'true')
+    os.environ.setdefault('WANDB_CONSOLE', 'off')
+    os.environ.setdefault('WANDB_SILENT', 'true')
+    # hwloc (pulled in by OpenMPI) probes GL/X11 unless disabled.
+    os.environ.setdefault('HWLOC_COMPONENTS', '-gl')
+    os.environ.setdefault('HWLOC_GL_LINUX_NVIDIA_DISABLE', '1')
+    # Stop OpenMPI/PMIx from GUI / oob probes that can emit X11 noise.
+    os.environ.setdefault('OMPI_MCA_btl', 'self,tcp')
+    os.environ.setdefault('OMPI_MCA_orte_base_help_aggregate', '0')
+    os.environ.setdefault('PMIX_MCA_gds', 'hash')
+    os.environ.setdefault('CUDA_DEVICE_ORDER', 'PCI_BUS_ID')
+
+
+def _disable_lightning_mpi_autodetect() -> None:
+    """Stop Lightning from importing mpi4py during Trainer construction.
+
+    ``MPIEnvironment.detect()`` calls ``from mpi4py import MPI``, which on this
+    host starts OpenMPI ``orted`` and can hang / print 'No protocol specified'.
+    Training already forces ``LightningEnvironment`` for multi-GPU DDP; test must
+    do the same (or disable detect) for single-GPU ``strategy='auto'``.
+    """
+    try:
+        from lightning_fabric.plugins.environments.mpi import MPIEnvironment
+
+        MPIEnvironment.detect = staticmethod(lambda: False)  # type: ignore[method-assign]
+    except Exception:
+        pass
+
+
+_force_headless_env()
+
 import pytorch_lightning as pl
 import scanpy as sc
 from sympy import limit
 import torch
 from datasets import concatenate_datasets, load_from_disk
 from pytorch_lightning.callbacks import TQDMProgressBar
-from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.strategies import DDPStrategy  # DeepSpeedStrategy
+from pytorch_lightning.loggers import CSVLogger, WandbLogger
+from pytorch_lightning.plugins.environments import LightningEnvironment
+
+_disable_lightning_mpi_autodetect()
 
 from perturbgen.configs import ROOT
 from perturbgen.Dataloaders.datamodule import PerturbGenDataModule
@@ -19,6 +66,7 @@ from perturbgen.Model.trainer import CountDecoderTrainer, PerturbGenTrainer
 from perturbgen.src.utils import (
     condition_for_count_loss,
     get_idx_for_filtering,
+    load_frozen_split,
     randomised_split,
     read_dataset_files,
     str2bool,
@@ -43,6 +91,16 @@ def get_args(argv):
         type=str2bool,
         default=True,
         help='split data for extrapolation',
+    )
+    parser.add_argument(
+        '--split_path',
+        type=str,
+        default=None,
+        help=(
+            'Optional path to a frozen split .pkl from notebook 02 '
+            '(keys: train_indices, val_indices, test_indices). '
+            'When set, overrides stratified/random index generation.'
+        ),
     )
     parser.add_argument(
         '--output_dir',
@@ -318,9 +376,56 @@ def get_args(argv):
     return args
 
 
+def _apply_ckpt_arch_hparams(args) -> dict:
+    """Override CLI arch hparams from Lightning checkpoint hyper_parameters.
+
+    extract-embedding builds a fresh module then loads weights; if ``d_model`` /
+    ``d_ff`` / etc. differ from training defaults, load_state_dict crashes with
+    size mismatches. Prefer the values stored in the .ckpt whenever present.
+    """
+    path = None
+    if args.test_mode == 'masking':
+        path = args.ckpt_masking_path
+    elif args.test_mode == 'count':
+        path = args.ckpt_count_path or args.ckpt_masking_path
+    if not path or not str(path).endswith('.ckpt') or not os.path.isfile(path):
+        return {}
+    try:
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    except TypeError:
+        ckpt = torch.load(path, map_location='cpu')
+    hp = ckpt.get('hyper_parameters') or {}
+    if not hp:
+        return {}
+    overrides = {
+        'd_model': 'd_model',
+        'd_ff': 'd_ff',
+        'num_layers': 'num_layers',
+        'mask_scheduler': 'mask_scheduler',
+        'pos_encoding_mode': 'pos_encoding_mode',
+        'context_mode': 'context_mode',
+        'pred_tps': 'pred_tps',
+    }
+    for ckpt_key, arg_key in overrides.items():
+        if ckpt_key not in hp or hp[ckpt_key] is None:
+            continue
+        old = getattr(args, arg_key)
+        new = hp[ckpt_key]
+        if old != new:
+            print(f'Overriding --{arg_key} from ckpt: {old} -> {new}')
+        setattr(args, arg_key, new)
+    args.num_heads = int(hp.get('num_heads', getattr(args, 'num_heads', 8)))
+    return dict(hp)
+
+
 def main(argv=None) -> None:
     """Run training."""
+    # Re-apply before any logger/trainer construction (some libs reset DISPLAY).
+    _force_headless_env()
     args = get_args(argv)
+    ckpt_hp = _apply_ckpt_arch_hparams(args)
+    if args.wandb_mode == 'disabled':
+        os.environ['WANDB_MODE'] = 'disabled'
     print('positional encoding:', args.pos_encoding_mode)
 
     # PyTorch Lightning allows to set all necessary seeds in one function call.
@@ -353,6 +458,17 @@ def main(argv=None) -> None:
         f'---PerturbGen training --- \n'
         f'Target vocab size: {max_tgt_input_id}, max sequence length: {max_len}'
     )
+
+    # Drop covariate names that are not present in this dataset (CLI defaults are
+    # for a different cohort; LPS uses cell_type_harmonized / time_after_LPS).
+    if args.var_list:
+        ref_ds = next(iter(tgt_datasets.values()))
+        available = set(getattr(ref_ds, 'column_names', None) or ref_ds.features.keys())
+        missing = [v for v in args.var_list if v not in available]
+        kept = [v for v in args.var_list if v in available]
+        if missing:
+            print(f'Skipping --var_list entries absent from dataset: {missing}')
+        args.var_list = kept if kept else None
 
     V = max_tgt_input_id + 50
     for keys, dataset in tgt_datasets.items():
@@ -488,7 +604,12 @@ def main(argv=None) -> None:
     # Preparing train-test split
     # --------------------------
     if args.split:
-        if args.splitting_mode == 'stratified':
+        if args.split_path:
+            train_indices, val_indices, test_indices = load_frozen_split(
+                args.split_path
+            )
+            print(f'Loaded frozen split from {args.split_path}')
+        elif args.splitting_mode == 'stratified':
             # start preprocessing to avoid loading anndata into datamodule
             train_indices, val_indices, test_indices = stratified_split(
                 tgt_adata=tgt_adata_tmp,
@@ -497,11 +618,6 @@ def main(argv=None) -> None:
                 groups=args.split_obs,
                 seed=args.seed,
             )
-
-            # check that indices are unique to avoid data leakage
-            assert len(set(train_indices).intersection(val_indices)) == 0
-            assert len(set(train_indices).intersection(test_indices)) == 0
-            assert len(set(val_indices).intersection(test_indices)) == 0
         elif args.splitting_mode == 'random':
             train_indices, val_indices, test_indices = randomised_split(
                 adata=tgt_adata_tmp,
@@ -514,6 +630,10 @@ def main(argv=None) -> None:
                 "split is not available, must be either '"
                 "random','stratified' or 'unseen_donor'"
             )
+        # check that indices are unique to avoid data leakage
+        assert len(set(train_indices).intersection(val_indices)) == 0
+        assert len(set(train_indices).intersection(test_indices)) == 0
+        assert len(set(val_indices).intersection(test_indices)) == 0
         print(
             f'Number of samples in train set: {len(train_indices)}\n'
             f'Number of samples in val set: {len(val_indices)}\n'
@@ -542,13 +662,17 @@ def main(argv=None) -> None:
     n_total_tps = len(tgt_adatas)
     # Initialize model module
     # ----------------------------------------------------------------------------------
+    # Prefer checkpoint architecture when available (must match weight shapes).
+    max_seq_length = int(ckpt_hp.get('max_seq_length', max_len + 100))
+    tgt_vocab_size = int(ckpt_hp.get('tgt_vocab_size', max_tgt_input_id + 50))
+    num_heads = int(getattr(args, 'num_heads', 8))
     test_kwargs = {
-        'tgt_vocab_size': max_tgt_input_id + 50,  # add 50 for extra tokens
+        'tgt_vocab_size': tgt_vocab_size,
         'd_model': args.d_model,
-        'num_heads': 8,
+        'num_heads': num_heads,
         'num_layers': args.num_layers,
         'd_ff': args.d_ff,
-        'max_seq_length': max_len + 100,
+        'max_seq_length': max_seq_length,
         'dropout': 0,
         'generate': args.generate,
         'context_tps': args.context_tps,
@@ -579,6 +703,8 @@ def main(argv=None) -> None:
         test_kwargs['deg_pkl_path'] = args.deg_pkl_path
         test_kwargs['gene_embs_list'] = gene_embs_list
         test_kwargs['gene_embs_condition'] = args.gene_embs_condition
+        # Rouge is only useful for generation; loading evaluate/rouge can hang headless.
+        test_kwargs['return_rouge_score'] = bool(args.generate)
         pretrained_module = PerturbGenTrainer(**test_kwargs)
 
     elif args.test_mode == 'count':
@@ -640,52 +766,51 @@ def main(argv=None) -> None:
     # Setup trainer
     # ----------------------------------------------------------------------------------
     run_id = datetime.now().strftime('%Y%m%d_%H%M_PerturbGen')
-    log_path = os.path.join(
-        './T_perturb/perturbgen/wandb/wandb',
-        run_id,
-    )
-    os.makedirs(os.path.join(os.getcwd(), log_path), exist_ok=True)
-
-    # The tensorboard logger allows for monitoring the progress of training
-    if torch.cuda.device_count() > 1:
-        # multi gpu training with group logging
-        wandb_logger = WandbLogger(
-            entity=args.wandb_entity,
-            project=args.wandb_project,
-            name=f'{run_id}_{str(uuid.uuid4())[:6]}',
-            save_dir='./T_perturb/perturbgen/wandb/wandb',
-            log_model=True,
-            mode=args.wandb_mode,
-        )  # noqa
-    else:
-        wandb_logger = WandbLogger(
-            entity=args.wandb_entity,
-            project=args.wandb_project,
-            name=f'{run_id}',
-            save_dir='./T_perturb/perturbgen/wandb/wandb',
-            log_model=True,
-            mode=args.wandb_mode,
+    # Prefer CSV logger for local metrics. Only attach WandB when explicitly enabled.
+    # Always creating WandbLogger (even mode=disabled) is what triggered
+    # X11 "No protocol specified" during Trainer construction on this host.
+    loggers = [CSVLogger(save_dir='logs', name=run_id)]
+    if args.wandb_mode != 'disabled':
+        log_path = os.path.join('./T_perturb/perturbgen/wandb/wandb', run_id)
+        os.makedirs(os.path.join(os.getcwd(), log_path), exist_ok=True)
+        wandb_name = (
+            f'{run_id}_{str(uuid.uuid4())[:6]}'
+            if torch.cuda.device_count() > 1
+            else run_id
         )
+        loggers.insert(
+            0,
+            WandbLogger(
+                entity=args.wandb_entity,
+                project=args.wandb_project,
+                name=wandb_name,
+                save_dir='./T_perturb/perturbgen/wandb/wandb',
+                log_model=False,
+                mode=args.wandb_mode,
+            ),
+        )
+    print(f'CSV metrics: {loggers[-1].log_dir}/metrics.csv')
 
     # In this simple example we just check if a GPU is available.
     # For training larger models in a distributed settings, this needs more care.
     accelerator = 'gpu' if torch.cuda.is_available() else 'cpu'
-    print('Using device {}.'.format(accelerator))
+    # Force single-process test: multi-GPU DDP on this host reintroduces MPI/X11 hangs.
+    n_devices = 1
+    print('Using device {} (n_devices={}).'.format(accelerator, n_devices))
 
     # Instantiate trainer object.
-    # The lightning trainer has a large number of parameters that can improve the
-    # training experience. It is recommended to check out the lightning docs for
-    # further information.
-    # Lightning allows for simple multi-gpu training, gradient accumulation, half
-    # precision training, etc. using the trainer class.
-    ddp_strategy = DDPStrategy(find_unused_parameters=False)
+    # Force LightningEnvironment so MPIEnvironment.detect() never imports mpi4py.
+    _force_headless_env()
+    _disable_lightning_mpi_autodetect()
     trainer = pl.Trainer(
-        logger=wandb_logger,
-        callbacks=[TQDMProgressBar(refresh_rate=10)],
+        logger=loggers,
+        callbacks=[TQDMProgressBar(refresh_rate=1)],
         accelerator=accelerator,
-        num_nodes=args.num_node,
-        devices=-1 if torch.cuda.is_available() else 1,  # inference only on one gpu
-        strategy=ddp_strategy if torch.cuda.device_count() > 1 else 'auto',
+        num_nodes=1,
+        devices=n_devices,
+        strategy='auto',
+        plugins=[LightningEnvironment()],
+        enable_progress_bar=True,
     )
     # Finally, kick of the training process.
     if args.test_mode == 'masking':

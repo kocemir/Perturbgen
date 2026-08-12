@@ -729,7 +729,9 @@ def return_prediction_adata(
     # adata.obsm
     cls_embeddings = torch.cat(test_dict['cls_embeddings'], dim=0).numpy()
     # adata.obs
-    obs_dict = {obs: np.concatenate(test_dict[obs]) for obs in obs_key}
+    obs_dict = {}
+    for obs in tqdm.tqdm(obs_key, desc='Building obs columns', leave=False):
+        obs_dict[obs] = np.concatenate(test_dict[obs])
     test_obs = pd.DataFrame(obs_dict)
     # # adata.var
     if marker_genes is not None:
@@ -753,7 +755,11 @@ def return_prediction_adata(
         },
     )
     if sum_gene_embs is not None:
-        for condition in sum_gene_embs.keys():
+        for condition in tqdm.tqdm(
+            sum_gene_embs.keys(),
+            desc='Writing condition embeddings',
+            leave=False,
+        ):
             adata.varm[condition] = sum_gene_embs[condition]
     adata.write_h5ad(os.path.join(output_dir, f'{file_name}.h5ad'))
     print('End saving embeddings---')
@@ -808,7 +814,9 @@ def return_generation_adata(
     # adata.obsm
     cls_embeddings = torch.cat(test_dict['cls_embeddings']).numpy()
     # adata.obs
-    obs_dict = {obs: np.concatenate(test_dict[obs]) for obs in obs_key}
+    obs_dict = {}
+    for obs in tqdm.tqdm(obs_key, desc='Building obs columns', leave=False):
+        obs_dict[obs] = np.concatenate(test_dict[obs])
     test_obs = pd.DataFrame(obs_dict)
 
     if (aggregate is True) and ('cell_idx' in test_obs.columns):
@@ -872,6 +880,7 @@ def return_perturbation_adata(
     file_name: str,
     mode: Literal['inference', 'generate'],
     aggregate: bool = True,
+    gene_names: list[str] | None = None,
 ) -> ad.AnnData:
     """
     Description:
@@ -889,6 +898,10 @@ def return_perturbation_adata(
         Filename for output file
     mode: `Literal['inference', 'generation']`
         Mode of test_step.
+    gene_names: optional count-space gene names (length = n_genes). When count
+        matrices are present these define ``adata.var``; token-level gene
+        cosine similarities are stored in ``adata.uns`` instead of ``varm``
+        so their length (often ≠ n_genes) cannot break AnnData assignment.
     Returns:
     --------
     adata: `~anndata.AnnData` \n
@@ -927,9 +940,9 @@ def return_perturbation_adata(
         if len(test_dict['true_counts']) > 0:
             true_counts = torch.cat(test_dict['true_counts']).numpy()
     mean_cos_similarity = torch.cat(test_dict['mean_cosine_similarity']).numpy()
-    # adata.varm
+    # token-level gene cosine similarities (n_cells x n_marker_genes)
     gene_cos_similarity = torch.cat(test_dict['gene_cosine_similarity'], dim=0).numpy()
-    cos_similarity_df = pd.DataFrame(gene_cos_similarity, columns=marker_genes.keys())
+    cos_similarity_df = pd.DataFrame(gene_cos_similarity, columns=list(marker_genes.keys()))
     cos_similarity_df_ = cos_similarity_df.T
     # convert columns to string
     cos_similarity_df_.columns = cos_similarity_df_.columns.astype(str)
@@ -938,7 +951,7 @@ def return_perturbation_adata(
     test_obs = pd.DataFrame(obs_dict)
 
     if (aggregate is True) and ('cell_idx' in test_obs.columns):
-        if pred_counts is not None:
+        if pert_counts is not None:
             pert_counts = mean_duplicates(test_obs, pert_counts)
         if true_counts is not None:
             true_counts = mean_duplicates(test_obs, true_counts)
@@ -976,27 +989,54 @@ def return_perturbation_adata(
             for key in rouge_dict.keys():
                 rouge_dict[key] = mean_duplicates(test_obs, rouge_dict[key])
         obsm_dict.update(rouge_dict)
-    varm_dict = {
-        'gene_cos_similarity': cos_similarity_df_.values,
-    }
-    # create adata
-    adata = ad.AnnData(
-        obs=test_obs,
-        obsm=obsm_dict,
-        varm=varm_dict,
-        var=pd.DataFrame(
-            index=cos_similarity_df.columns,
-        ),
+
+    # Count decoder outputs n_genes (e.g. 2000 HVGs); token-level marker gene
+    # cosine sims often use a different length (e.g. ~1856). Prefer count space
+    # for adata.X / layers / var when counts are present.
+    count_ref = next(
+        (c for c in (pert_counts, pred_counts, true_counts) if c is not None),
+        None,
     )
-    if pert_counts is not None:
-        if pert_counts.shape[1] > 0:
-            adata.X = pert_counts
-    if true_counts is not None:
-        if true_counts.shape[1] > 0:
+    test_obs = test_obs.reset_index(drop=True)
+    if count_ref is not None:
+        n_genes = int(count_ref.shape[1])
+        if gene_names is not None and len(gene_names) == n_genes:
+            var_index = [str(g) for g in gene_names]
+        else:
+            var_index = [f'gene_{i}' for i in range(n_genes)]
+            if gene_names is not None:
+                print(
+                    f'Warning: gene_names length {len(gene_names)} != n_genes '
+                    f'{n_genes}; using generic gene_* var names'
+                )
+        X = pert_counts if pert_counts is not None else np.zeros(
+            (test_obs.shape[0], n_genes), dtype=np.float32
+        )
+        adata = ad.AnnData(
+            X=X,
+            obs=test_obs,
+            var=pd.DataFrame(index=var_index),
+            obsm=obsm_dict,
+        )
+        if true_counts is not None and true_counts.shape[1] == n_genes:
             adata.layers['true_counts'] = true_counts
-    if pred_counts is not None:
-        if pred_counts.shape[1] > 0:
+        if pred_counts is not None and pred_counts.shape[1] == n_genes:
             adata.layers['pred_counts'] = pred_counts
+        # keep token-level gene metrics without forcing adata.var length
+        cos_sim_uns = cos_similarity_df_.copy()
+        cos_sim_uns.index = cos_sim_uns.index.astype(str)
+        cos_sim_uns.columns = cos_sim_uns.columns.astype(str)
+        adata.uns['gene_cos_similarity'] = cos_sim_uns
+        adata.uns['gene_cos_similarity_genes'] = list(cos_sim_uns.index)
+    else:
+        adata = ad.AnnData(
+            obs=test_obs,
+            obsm=obsm_dict,
+            varm={'gene_cos_similarity': cos_similarity_df_.values},
+            var=pd.DataFrame(index=[str(g) for g in marker_genes.keys()]),
+        )
+
+    os.makedirs(output_dir, exist_ok=True)
     adata.write_h5ad(os.path.join(output_dir, file_name))
     print('anndata generation completed---')
     return adata
@@ -1599,6 +1639,29 @@ def label_encoder(adata, encoder, condition_key=None) -> np.ndarray:
         labels[adata.obs[condition_key] == condition] = label
     labels = [int(x) for x in labels]
     return labels
+
+
+def load_frozen_split(path: str | Path):
+    """Load train/val/test row indices from a Notebook-02 freeze ``.pkl``.
+
+    Expected keys: ``train_indices``, ``val_indices``, ``test_indices``
+    (as produced under ``tokenized_data/<dataset>/splits/``).
+    """
+    import pickle
+
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f'split_path not found: {path}')
+    with path.open('rb') as f:
+        payload = pickle.load(f)
+    required = ('train_indices', 'val_indices', 'test_indices')
+    missing = [k for k in required if k not in payload]
+    if missing:
+        raise KeyError(f'split pickle missing keys {missing}: {path}')
+    train_indices = [int(i) for i in payload['train_indices']]
+    val_indices = [int(i) for i in payload['val_indices']]
+    test_indices = [int(i) for i in payload['test_indices']]
+    return train_indices, val_indices, test_indices
 
 
 def randomised_split(adata: ad.AnnData, train_prop: float, test_prop: float, seed: int):

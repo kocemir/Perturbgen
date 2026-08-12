@@ -9,8 +9,16 @@ import torch
 import torch.nn.functional as F
 
 
-def latent_collapse_stats(z: torch.Tensor) -> Dict[str, float]:
-    """Diagnostics for representation collapse."""
+def latent_collapse_stats(
+    z: torch.Tensor,
+    max_samples: int = 4096,
+    seed: int = 42,
+) -> Dict[str, float]:
+    """Diagnostics for representation collapse.
+
+    Mean pairwise cosine uses at most ``max_samples`` rows to avoid O(n²) RAM
+    blow-ups on full-dataset embedding dumps.
+    """
     z = z.detach().float()
     if z.ndim != 2 or z.size(0) < 2:
         return {
@@ -19,9 +27,14 @@ def latent_collapse_stats(z: torch.Tensor) -> Dict[str, float]:
             'norm_mean': float(z.norm(dim=-1).mean().item()) if z.numel() else 0.0,
         }
     z_norm = F.normalize(z, dim=-1)
+    n = z_norm.size(0)
+    if n > max_samples:
+        g = torch.Generator(device=z_norm.device)
+        g.manual_seed(seed)
+        idx = torch.randperm(n, generator=g, device=z_norm.device)[:max_samples]
+        z_norm = z_norm[idx]
+        n = z_norm.size(0)
     sim = z_norm @ z_norm.T
-    n = sim.size(0)
-    # exclude diagonal
     mask = ~torch.eye(n, dtype=torch.bool, device=sim.device)
     mean_cosine = sim[mask].mean().item()
     return {
@@ -67,11 +80,27 @@ def vicreg_var_cov(
     return var_loss, cov_loss
 
 
+def subsample_embeddings(
+    features: np.ndarray,
+    labels: np.ndarray,
+    max_samples: int = 8000,
+    seed: int = 42,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Random subsample for sklearn metrics on large dumps."""
+    n = features.shape[0]
+    if n <= max_samples:
+        return features, labels
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(n, size=max_samples, replace=False)
+    return features[idx], labels[idx]
+
+
 def linear_probe_accuracy(
     features: np.ndarray,
     labels: np.ndarray,
     test_size: float = 0.2,
     seed: int = 42,
+    max_samples: int = 8000,
 ) -> float:
     """Simple logistic-regression probe accuracy (sklearn if available)."""
     from sklearn.linear_model import LogisticRegression
@@ -81,26 +110,36 @@ def linear_probe_accuracy(
 
     if len(np.unique(labels)) < 2:
         return float('nan')
+    features, labels = subsample_embeddings(features, labels, max_samples, seed)
+    _, counts = np.unique(labels, return_counts=True)
+    stratify = labels if counts.min() >= 2 else None
     x_train, x_test, y_train, y_test = train_test_split(
         features,
         labels,
         test_size=test_size,
         random_state=seed,
-        stratify=labels if len(np.unique(labels)) > 1 else None,
+        stratify=stratify,
     )
     clf = make_pipeline(
         StandardScaler(),
-        LogisticRegression(max_iter=1000, multi_class='auto'),
+        LogisticRegression(max_iter=500, solver='saga', tol=1e-3, n_jobs=1),
     )
     clf.fit(x_train, y_train)
     return float(clf.score(x_test, y_test))
 
 
-def silhouette_safe(features: np.ndarray, labels: np.ndarray) -> float:
+def silhouette_safe(
+    features: np.ndarray,
+    labels: np.ndarray,
+    max_samples: int = 1500,
+    seed: int = 42,
+) -> float:
+    """Silhouette on a small subsample (O(n²) pairwise distances)."""
     from sklearn.metrics import silhouette_score
 
     if len(np.unique(labels)) < 2 or features.shape[0] < 3:
         return float('nan')
+    features, labels = subsample_embeddings(features, labels, max_samples, seed)
     return float(silhouette_score(features, labels, metric='euclidean'))
 
 
@@ -108,10 +147,15 @@ def neighbor_purity(
     features: np.ndarray,
     labels: np.ndarray,
     k: int = 15,
+    max_samples: int = 8000,
+    seed: int = 42,
 ) -> float:
     """Fraction of kNN neighbors sharing the same label."""
     from sklearn.neighbors import NearestNeighbors
 
+    if features.shape[0] <= k:
+        return float('nan')
+    features, labels = subsample_embeddings(features, labels, max_samples, seed)
     if features.shape[0] <= k:
         return float('nan')
     nn = NearestNeighbors(n_neighbors=k + 1, metric='euclidean')

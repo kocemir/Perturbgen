@@ -221,6 +221,8 @@ def main() -> None:
         for keys, tgt_adata in tgt_adatas.items():
             tgt_counts_dict[keys] = tgt_adata.X
         config['trainer']['n_genes'] = tgt_adata_tmp.shape[1]
+        # Count-space gene order for return_perturbation_adata (must match n_genes)
+        config['trainer']['gene_names'] = list(tgt_adata_tmp.var_names.astype(str))
         # Initialize model module
         # ----------------------------------------------------------------------------------
         decoder_module = PerturberTrainer(

@@ -16,9 +16,11 @@
 # files below (90m_LPS.dataset / 90m_LPS.h5ad) exist.
 data:
   src_dataset_file: "T_perturb/tokenized_data/lps_90min_perturb/dataset_2000_hvg_src/90m_LPS.dataset" # 90-minute LPS SOURCE state (IL1B is expressed here)
-  tgt_dataset_folder: "T_perturb/tokenized_data/lps_90min_perturb/dataset_2000_hvg_tgt" # downstream target time points (6h, 10h)
+  # With REFERENCE_TIME=90m_LPS and full TIME_POINT_ORDER, targets are:
+  # 1_normal, 2_6h_LPS, 3_10h_LPS
+  tgt_dataset_folder: "T_perturb/tokenized_data/lps_90min_perturb/dataset_2000_hvg_tgt"
   src_adata: "T_perturb/tokenized_data/lps_90min_perturb/h5ad_pairing_2000_hvg_src/90m_LPS.h5ad" # source adata (90m_LPS)
-  tgt_adata_folder: "T_perturb/tokenized_data/lps_90min_perturb/h5ad_pairing_2000_hvg_tgt" # target adata folder
+  tgt_adata_folder: "T_perturb/tokenized_data/lps_90min_perturb/h5ad_pairing_2000_hvg_tgt"
   # cond_list:
   #   - "cell_type_harmonized"  # list of condition columns used during training
 
@@ -39,12 +41,12 @@ trainer:
   # datasets and matches the manuscript's 90min config. Set them explicitly only
   # if you need to override the derived values.
   mask_scheduler: "pow" # masking scheduler type
-  output_dir: "T_perturb/res/perturbation" # output directory for results
+  output_dir: "T_perturb/res/perturbation/il1b_src_90m" # output directory for results
   mapping_dict_path: "T_perturb/tokenized_data/lps_90min_perturb/token_id_to_genename_2000_hvg.pkl" # mapping dictionary from the 90min tokenization step
   tokenid_to_rowid_path: "T_perturb/tokenized_data/lps_90min_perturb/tokenid_to_rowid_2000_hvg.pkl" # tokenid to rowid mapping from the 90min tokenization step
   encoder: "scmaskgit" # encoder type (Pretrain model)
   encoder_path: "Perturbgen/pretraining_cohort/20250709_1223_cellgen_train_masking_lr_5e-05_wd_1e-06_batch_64_ptime_pos_sin_m_pow_tp_1-2-3_s_42-epoch=00.ckpt" # path to pretrained encoder weights
-  context_mode: false # whether to use context mode, True is recommeneded for perturbation prediction of data with multiple time points
+  context_mode: false # original IL1B example setting (shipped manuscript-style config)
   temperature: 1.5 # temperature for generation
   iterations: 19 # number of generation iterations
   pos_encoding_mode: "time_pos_sin" # positional encoding mode
@@ -59,14 +61,15 @@ trainer:
     - "cell_type_harmonized"
     - "cell_pairing_index"
     - "time_after_LPS"
-  pred_tps: # time points to predict
-    - 1
+  # 90m source → 1_normal, 2_6h_LPS, 3_10h_LPS; predict 6h and 10h
+  pred_tps:
     - 2
+    - 3
 
 
 datamodule:
   batch_size: 64 # batch size for training
-  num_workers: 8 # number of workers for data loading
+  num_workers: 0 # 0 avoids headless hwloc/X11 issues; full LPS src is large
   shuffle: false # whether to shuffle the data
   split: false # whether to split the data
   # max_len is omitted on purpose: val.py sets it from the derived max sequence
@@ -75,10 +78,12 @@ datamodule:
     - "cell_type_harmonized"
     - "time_after_LPS"
     - "cell_pairing_index"
-  pred_tps: # time points to predict/ perturb, same as in trainer
-    - 1
+  pred_tps: # must match trainer.pred_tps
     - 2
+    - 3
 
 model:
   precision: 16 # precision for training
-  ckpt_masking_path: "path/to/count_decoder_checkpoint.ckpt" # path to count decoder checkpoint from previous count decoder training step (notebook 3)
+  # Count-decoder ckpt from notebook 03 (best val/mse @ epoch=29).
+  # Key name is historical; this is the count trainer checkpoint.
+  ckpt_masking_path: "T_perturb/res/count_split/checkpoints/20260809_1447_cellgen_train_count_lr_0.001_wd_0.001_batch_256_drop_0.1_zinb_tp_1-2-3_s_0_pos_time_pos_sin_m_pow-epoch=29.ckpt"

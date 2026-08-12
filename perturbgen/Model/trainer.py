@@ -392,6 +392,52 @@ class PerturbGenTrainer(LightningModule):
             batch,
             generate=self.generate,
         )
+        # Log masking test metrics when logits/labels are available.
+        # generate=True or return_embeddings=True (not_masked) can leave labels=None.
+        if outputs is not None:
+            for t in outputs.keys():
+                if ('dec_logits' not in outputs[t]) or ('labels' not in outputs[t]):
+                    continue
+                dec_logits = outputs[t]['dec_logits']
+                labels = outputs[t]['labels']
+                if dec_logits is None or labels is None:
+                    continue
+                with torch.no_grad():
+                    perp = self.perplexity(dec_logits, labels)
+                dec_logits = dec_logits.reshape(-1, dec_logits.size(-1))
+                labels = labels.reshape(-1)
+                masking_loss = self.masking_loss(dec_logits, labels)
+                self.log(
+                    'test/loss',
+                    masking_loss,
+                    on_step=True,
+                    on_epoch=True,
+                    prog_bar=True,
+                    logger=True,
+                    batch_size=batch['tgt_input_ids_t1'].shape[0],
+                    rank_zero_only=True,
+                    sync_dist=False,
+                )
+                self.log(
+                    'test/perplexity',
+                    perp,
+                    on_step=True,
+                    on_epoch=True,
+                    prog_bar=True,
+                    logger=True,
+                    batch_size=batch['tgt_input_ids_t1'].shape[0],
+                    rank_zero_only=True,
+                    sync_dist=False,
+                )
+
+        # Metrics-only mode: skip embedding/generation bookkeeping.
+        if (
+            (not self.return_embeddings)
+            and (not self.generate)
+            and (not self.return_gene_embs)
+            and (not self.return_attn)
+        ):
+            return
 
         if self.condition_dict is not None:
             cond_length = len(self.condition_dict)
@@ -496,6 +542,15 @@ class PerturbGenTrainer(LightningModule):
                     self.test_dict[var].append(var_values)
 
     def on_test_epoch_end(self):
+        # Metrics-only test: nothing to aggregate/write after logging in test_step.
+        if (
+            (not self.return_embeddings)
+            and (not self.generate)
+            and (not self.return_gene_embs)
+            and (not self.return_attn)
+        ):
+            return
+
         if self.return_attn:
             self_attn_weights = torch.stack(self.test_dict['self_attn_weights'])
             cross_attn_weights = torch.stack(self.test_dict['cross_attn_weights'])
@@ -517,27 +572,33 @@ class PerturbGenTrainer(LightningModule):
                 output_dir=self.output_dir,
                 file_name=f'{self.date}_cross_attn_weights',
             )
-        obs_key = self.var_list if len(self.var_list) > 0 else []
+        var_list = self.var_list if self.var_list is not None else []
+        obs_key = list(var_list) if len(var_list) > 0 else []
         obs_key.extend(['batch', 'cell_idx'])
         if self.return_embeddings:
-            # create folder to save gene embeddings
-            condition_dir = f'{self.output_dir}/conditions'
-            os.makedirs(condition_dir, exist_ok=True)
-            # compute mean gene embeddings
-            for condition in self.gene_embs_list:
-                self.sum_gene_embs[condition] = np.where(
-                    self.count_gene_embs[condition] != 0,
-                    self.sum_gene_embs[condition] / self.count_gene_embs[condition],
-                    0,
-                )
+            # Optional gene-embedding aggregation (only when return_gene_embs filled these).
+            sum_gene_embs = None
+            gene_embs_list = getattr(self, 'gene_embs_list', None)
+            sum_gene_embs_attr = getattr(self, 'sum_gene_embs', None)
+            count_gene_embs_attr = getattr(self, 'count_gene_embs', None)
+            if gene_embs_list is not None and sum_gene_embs_attr is not None:
+                condition_dir = f'{self.output_dir}/conditions'
+                os.makedirs(condition_dir, exist_ok=True)
+                for condition in gene_embs_list:
+                    self.sum_gene_embs[condition] = np.where(
+                        count_gene_embs_attr[condition] != 0,
+                        sum_gene_embs_attr[condition] / count_gene_embs_attr[condition],
+                        0,
+                    )
+                sum_gene_embs = self.sum_gene_embs
 
             return_prediction_adata(
                 test_dict=self.test_dict,
                 obs_key=obs_key,
-                marker_genes=self.marker_genes_dict,
+                marker_genes=getattr(self, 'marker_genes_dict', None),
                 gene_names=self.gene_names,
                 output_dir=self.output_dir,
-                sum_gene_embs=self.sum_gene_embs,
+                sum_gene_embs=sum_gene_embs,
                 file_name=f'{self.date}_inference_embs_'
                 f't{self.pred_tps}_{self.encoder}_'
                 f'm{self.mask_scheduler}',
@@ -639,11 +700,16 @@ class CountDecoderTrainer(LightningModule):
         tokenid_to_rowid_path: str | None = None,
         use_size_factor: bool = True,
         use_observed_size_factor: bool = True,
+        gene_names: List[str] | None = None,
         *args,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.save_hyperparameters()
+        # Never serialize full AnnData into hparams/CSV/TB/W&B — that dumps
+        # hundreds of MB and stalls training before epoch 0 (seen on LPS).
+        self.save_hyperparameters(ignore=['tgt_adata', 'gene_names'])
+        # Count-space gene order for perturbation AnnData export (n_genes).
+        self.gene_names = gene_names
         # only set precision for GPU
 
         set_matmul_precision_for_device(precision)

@@ -400,7 +400,10 @@ class PerturbGenDataModule(LightningDataModule):
                 d[dataset]['cell_pairing_index'] for d in batch
             ]
             if self.var_list is not None:
+                sample0 = batch[0][dataset]
                 for var in self.var_list:
+                    if var not in sample0:
+                        continue
                     out[f'{var}_t{time_step}'] = [d[dataset][var] for d in batch]
 
             out[f'tgt_input_ids_t{time_step}'] = pad_tensor_list(

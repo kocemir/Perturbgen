@@ -392,6 +392,11 @@ class JEPATrainer(LightningModule):
             self.test_embeddings['time'].append(
                 torch.full((out['z_src'].size(0),), t)
             )
+            idx_key = f'tgt_cell_idx_t{t}'
+            if idx_key in batch:
+                self.test_embeddings.setdefault('cell_idx', []).extend(
+                    list(batch[idx_key])
+                )
             for var in self.var_list:
                 key = f'{var}_t{t}'
                 if key in batch:

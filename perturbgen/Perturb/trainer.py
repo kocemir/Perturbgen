@@ -685,6 +685,9 @@ class PerturberTrainer(CountDecoderTrainer):
             perturbation_sequence = '_'.join(self.perturbation_sequence)
         else:
             perturbation_sequence = self.perturbation_sequence[0]
+        gene_names = getattr(self, 'gene_names', None)
+        if gene_names is not None:
+            gene_names = list(gene_names)
         return_perturbation_adata(
             test_dict=self.test_dict,
             obs_key=obs_key,
@@ -697,4 +700,5 @@ class PerturberTrainer(CountDecoderTrainer):
                 f'_t{self.perturbation_mode}.h5ad'
             ),
             mode=self.validation_mode,
+            gene_names=gene_names,
         )

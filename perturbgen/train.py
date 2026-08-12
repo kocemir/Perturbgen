@@ -15,10 +15,12 @@ from pytorch_lightning.strategies import DDPStrategy, DeepSpeedStrategy
 
 from perturbgen.configs import ROOT
 from perturbgen.Dataloaders.datamodule import PerturbGenDataModule
+from perturbgen.Model.gene_query_jepa_trainer import GeneQueryJEPATrainer
 from perturbgen.Model.jepa_trainer import JEPADecoderTrainer, JEPATrainer
 from perturbgen.Model.trainer import CountDecoderTrainer, PerturbGenTrainer
 from perturbgen.src.utils import (
     condition_for_count_loss,
+    load_frozen_split,
     randomised_split,
     read_dataset_files,
     str2bool,
@@ -65,7 +67,7 @@ def get_args(args=None):
         '--train_mode',
         type=str,
         default='masking',
-        help='Mode [masking, count, jepa, jepa_decoder]',
+        help='Mode [masking, count, jepa, jepa_decoder, jepa_gene_query]',
     )
     parser.add_argument(
         '--ema_decay',
@@ -142,6 +144,59 @@ def get_args(args=None):
             'transformer blocks (early exit). Heads/width stay as in ckpt.'
         ),
     )
+    # ---- Gene-Query JEPA (train_mode=jepa_gene_query) --------------------
+    parser.add_argument(
+        '--gq_n_queries',
+        type=int,
+        default=64,
+        help='Gene-Query JEPA: number of gene questions per cell per timepoint',
+    )
+    parser.add_argument(
+        '--gq_frac_shared',
+        type=float,
+        default=0.5,
+        help='Gene-Query JEPA: fraction of queries for genes in BOTH src and tgt',
+    )
+    parser.add_argument(
+        '--gq_frac_tgt_only',
+        type=float,
+        default=0.3,
+        help='Gene-Query JEPA: fraction of queries for genes ONLY in tgt '
+        '(the rest are absent decoys)',
+    )
+    parser.add_argument(
+        '--gq_lambda_gene',
+        type=float,
+        default=1.0,
+        help='Gene-Query JEPA: weight of the per-gene loss (primary)',
+    )
+    parser.add_argument(
+        '--gq_lambda_cell',
+        type=float,
+        default=0.1,
+        help='Gene-Query JEPA: weight of the pooled cell loss (auxiliary)',
+    )
+    parser.add_argument(
+        '--gq_predictor_layers',
+        type=int,
+        default=2,
+        help='Gene-Query JEPA: number of transformer decoder layers in predictor',
+    )
+    parser.add_argument(
+        '--gq_lambda_contrastive',
+        type=float,
+        default=0.3,
+        help=(
+            'Gene-Query JEPA: InfoNCE weight on present gene queries '
+            '(0 disables contrastive anti-collapse)'
+        ),
+    )
+    parser.add_argument(
+        '--gq_contrastive_temperature',
+        type=float,
+        default=0.1,
+        help='Gene-Query JEPA: InfoNCE temperature for present-gene contrastive',
+    )
     parser.add_argument(
         '--parallel_distribution',
         type=str,
@@ -153,6 +208,16 @@ def get_args(args=None):
         type=str2bool,
         default=True,
         help='split data for extrapolation',
+    )
+    parser.add_argument(
+        '--split_path',
+        type=str,
+        default=None,
+        help=(
+            'Optional path to a frozen split .pkl from notebook 02 '
+            '(keys: train_indices, val_indices, test_indices). '
+            'When set, overrides stratified/random index generation.'
+        ),
     )
     parser.add_argument(
         '--output_dir',
@@ -455,7 +520,12 @@ def main(argv=None) -> None:
     # where the metadata and information is shared across timepoints
     tgt_adata_tmp = tgt_adatas[f'tgt_h5ad_t{args.pred_tps[0]}']
     if args.split:
-        if args.splitting_mode == 'stratified':
+        if args.split_path:
+            train_indices, val_indices, test_indices = load_frozen_split(
+                args.split_path
+            )
+            print(f'Loaded frozen split from {args.split_path}')
+        elif args.splitting_mode == 'stratified':
             # start preprocessing to avoid loading anndata into datamodule
             train_indices, val_indices, test_indices = stratified_split(
                 tgt_adata=tgt_adata_tmp,
@@ -464,10 +534,6 @@ def main(argv=None) -> None:
                 groups=args.split_obs,
                 seed=42,
             )
-            # check that indices are unique to avoid data leakage
-            assert len(set(train_indices).intersection(val_indices)) == 0
-            assert len(set(train_indices).intersection(test_indices)) == 0
-            assert len(set(val_indices).intersection(test_indices)) == 0
         elif args.splitting_mode == 'random':
             train_indices, val_indices, test_indices = randomised_split(
                 adata=tgt_adata_tmp,
@@ -480,6 +546,10 @@ def main(argv=None) -> None:
                 "split is not available, must be either '"
                 "random','stratified' or 'unseen_donor'"
             )
+        # check that indices are unique to avoid data leakage
+        assert len(set(train_indices).intersection(val_indices)) == 0
+        assert len(set(train_indices).intersection(test_indices)) == 0
+        assert len(set(val_indices).intersection(test_indices)) == 0
         print(
             f'Number of samples in train set: {len(train_indices)}\n'
             f'Number of samples in val set: {len(val_indices)}\n'
@@ -613,10 +683,34 @@ def main(argv=None) -> None:
         trainer_kwargs['jepa_encoder_layers'] = args.jepa_encoder_layers
         trainer_kwargs['n_genes'] = src_adata.shape[1]
         decoder_module = JEPADecoderTrainer(**trainer_kwargs)
+    elif args.train_mode == 'jepa_gene_query':
+        trainer_kwargs['dropout'] = args.cellgen_dropout
+        trainer_kwargs['lr'] = args.cellgen_lr
+        trainer_kwargs['weight_decay'] = args.cellgen_wd
+        trainer_kwargs['ema_decay'] = args.ema_decay
+        trainer_kwargs['normalize_latents'] = args.normalize_latents
+        trainer_kwargs['vicreg_var_coeff'] = args.vicreg_var_coeff
+        trainer_kwargs['vicreg_cov_coeff'] = args.vicreg_cov_coeff
+        trainer_kwargs['vicreg_gamma'] = args.vicreg_gamma
+        trainer_kwargs['jepa_encoder'] = args.jepa_encoder
+        trainer_kwargs['freeze_jepa_encoder'] = args.freeze_jepa_encoder
+        trainer_kwargs['jepa_encoder_layers'] = args.jepa_encoder_layers
+        trainer_kwargs['n_queries'] = args.gq_n_queries
+        trainer_kwargs['frac_shared'] = args.gq_frac_shared
+        trainer_kwargs['frac_tgt_only'] = args.gq_frac_tgt_only
+        trainer_kwargs['lambda_gene'] = args.gq_lambda_gene
+        trainer_kwargs['lambda_cell'] = args.gq_lambda_cell
+        trainer_kwargs['predictor_layers'] = args.gq_predictor_layers
+        trainer_kwargs['lambda_contrastive'] = args.gq_lambda_contrastive
+        trainer_kwargs['contrastive_temperature'] = (
+            args.gq_contrastive_temperature
+        )
+        trainer_kwargs['var_list'] = args.var_list
+        pretrained_module = GeneQueryJEPATrainer(**trainer_kwargs)
     else:
         raise ValueError(
             'train_mode not recognised, needs to be '
-            'masking, count, jepa, or jepa_decoder'
+            'masking, count, jepa, jepa_decoder, or jepa_gene_query'
         )
     # Initialize data module
     # ----------------------------------------------------------------------------------
@@ -651,7 +745,7 @@ def main(argv=None) -> None:
         'sampling_keys': args.sampling_keys,
         'seed': 42, # fix seed for shuffling for reproducibility
     }
-    if args.train_mode in ('masking', 'jepa'):
+    if args.train_mode in ('masking', 'jepa', 'jepa_gene_query'):
         # TODO: Do not pass src into DataModule
         data_module = PerturbGenDataModule(**data_module_kwargs)
 
@@ -734,6 +828,36 @@ def main(argv=None) -> None:
             'val/jepa_loss' if val_indices is not None else 'train/jepa_loss'
         )
         mode = 'min'
+    elif args.train_mode == 'jepa_gene_query':
+        enc_tag = f'enc_{args.jepa_encoder}'
+        if args.jepa_encoder == 'scmaskgit':
+            enc_tag += f'_L{args.jepa_encoder_layers}'
+        freeze_tag = 'fz' if args.freeze_jepa_encoder else 'unfz'
+        contr_tag = (
+            f'_contr{args.gq_lambda_contrastive:g}'
+            if args.gq_lambda_contrastive and args.gq_lambda_contrastive > 0
+            else '_contr0'
+        )
+        vic_tag = ''
+        if args.vicreg_var_coeff and args.vicreg_var_coeff > 0:
+            vic_tag += f'_vicv{args.vicreg_var_coeff:g}'
+        if args.vicreg_cov_coeff and args.vicreg_cov_coeff > 0:
+            vic_tag += f'_vicc{args.vicreg_cov_coeff:g}'
+        filename = (
+            f'{run_id}_train_{args.train_mode}_lr_{args.cellgen_lr}'
+            f'_wd_{args.cellgen_wd}_batch_{args.batch_size}_'
+            f'{enc_tag}_{freeze_tag}'
+            f'_q{args.gq_n_queries}'
+            f'_predL{args.gq_predictor_layers}'
+            f'_lg{args.gq_lambda_gene:g}_lc{args.gq_lambda_cell:g}'
+            f'{contr_tag}{vic_tag}'
+            f'_ema_{args.ema_decay}'
+            f'_tp_{time_steps_str}_s_{args.seed}'
+        )
+        monitor_metric = (
+            'val/total_loss' if val_indices is not None else 'train/total_loss'
+        )
+        mode = 'min'
     elif args.train_mode == 'jepa_decoder':
         enc_tag = f'enc_{args.jepa_encoder}'
         if args.jepa_encoder == 'scmaskgit':
@@ -754,7 +878,7 @@ def main(argv=None) -> None:
     checkpoint_path = os.path.join(args.output_dir, 'checkpoints')
     # JEPA: one folder per hyperparam recipe so optional choices are visible
     # when browsing (enc/freeze/loss/bs/...), not only in the .ckpt name.
-    if args.train_mode in ('jepa', 'jepa_decoder'):
+    if args.train_mode in ('jepa', 'jepa_decoder', 'jepa_gene_query'):
         checkpoint_path = os.path.join(checkpoint_path, filename)
         ckpt_filename = '{epoch:02d}'
     else:
@@ -816,7 +940,7 @@ def main(argv=None) -> None:
         )
     elif args.parallel_distribution == 'ddp':
         # scmaskgit-backed JEPA only uses the encode path; MaskGIT heads are unused.
-        find_unused = args.train_mode in ('jepa', 'jepa_decoder')
+        find_unused = args.train_mode in ('jepa', 'jepa_decoder', 'jepa_gene_query')
         # Force Lightning's own process group — mpi4py is installed on this host
         # and PL would otherwise pick MPIEnvironment/OpenMPI, which hangs here
         # (orted / "No network interfaces for out-of-band communications").
@@ -826,7 +950,15 @@ def main(argv=None) -> None:
             process_group_backend='nccl',
         )
 
-    trainer = pl.Trainer(
+    # Single-GPU 'auto' still probes MPIEnvironment.detect() → mpi4py/orted hang.
+    # Always pin LightningEnvironment (multi-GPU DDP already sets it on the strategy).
+    try:
+        from lightning_fabric.plugins.environments.mpi import MPIEnvironment
+
+        MPIEnvironment.detect = staticmethod(lambda: False)  # type: ignore[method-assign]
+    except Exception:
+        pass
+    trainer_kwargs = dict(
         logger=loggers,
         callbacks=[
             TQDMProgressBar(refresh_rate=10),
@@ -839,6 +971,9 @@ def main(argv=None) -> None:
         num_nodes=args.num_node,
         strategy=parallel_comp_strategy if torch.cuda.device_count() > 1 else 'auto',
     )
+    if torch.cuda.device_count() <= 1:
+        trainer_kwargs['plugins'] = [LightningEnvironment()]
+    trainer = pl.Trainer(**trainer_kwargs)
 
     if args.train_mode == 'masking':
         # Finally, kick of the training process.
@@ -866,7 +1001,7 @@ def main(argv=None) -> None:
                 )
         else:
             trainer.fit(pretrained_module, data_module)
-    elif args.train_mode == 'jepa':
+    elif args.train_mode in ('jepa', 'jepa_gene_query'):
         # Token embeddings may be warm-started inside JEPATrainer from
         # --ckpt_masking_path; do not PL-resume unless path is a JEPA ckpt.
         trainer.fit(pretrained_module, data_module)
@@ -875,7 +1010,7 @@ def main(argv=None) -> None:
     else:
         raise ValueError(
             'train_mode not recognised, needs to be '
-            'masking, count, jepa, or jepa_decoder'
+            'masking, count, jepa, jepa_decoder, or jepa_gene_query'
         )
 
 if __name__ == '__main__':

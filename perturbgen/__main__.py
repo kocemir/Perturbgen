@@ -1,5 +1,19 @@
 """Command-line interface for PerturbGen."""
 
+import os
+
+# Headless-first: kill X11 "No protocol specified" before any heavy import.
+# OpenMPI/hwloc (via mpi4py) is the usual culprit on this host — disable GL probe.
+os.environ.pop("DISPLAY", None)
+os.environ.pop("WAYLAND_DISPLAY", None)
+os.environ["MPLBACKEND"] = "Agg"
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("WANDB_DISABLE_CODE", "true")
+os.environ.setdefault("WANDB_CONSOLE", "off")
+os.environ.setdefault("HWLOC_COMPONENTS", "-gl")
+os.environ.setdefault("HWLOC_GL_LINUX_NVIDIA_DISABLE", "1")
 
 import click
 
@@ -44,6 +58,7 @@ class OrderedGroup(click.Group):
         "train-mask",
         "train-decoder",
         "train-jepa",
+        "train-jepa-gene-query",
         "train-jepa-decoder",
         "extract-embedding",
         "eval-jepa",
@@ -90,6 +105,10 @@ def train_decoder(args):
 @click.argument("args", nargs=-1)
 def extract_embedding(args):
     """Load checkpoint and extract the embeddings."""
+    # Re-clear DISPLAY right before val import (some shells re-export it).
+    os.environ.pop("DISPLAY", None)
+    os.environ.pop("WAYLAND_DISPLAY", None)
+    os.environ["MPLBACKEND"] = "Agg"
     click.echo("loading, please wait...")
     from perturbgen.val import main
     main(args)
@@ -114,6 +133,22 @@ def train_jepa(args):
 
 @main.command(
     context_settings={"ignore_unknown_options": True, "help_option_names": []},
+    name="train-jepa-gene-query",
+)
+@click.argument("args", nargs=-1)
+def train_jepa_gene_query(args):
+    """Train Gene-Query JEPA (predict per-gene target embeddings)."""
+    click.echo("loading, please wait...")
+    from perturbgen.train import main
+
+    forwarded = list(args)
+    if "--train_mode" not in forwarded:
+        forwarded = ["--train_mode", "jepa_gene_query", *forwarded]
+    main(forwarded)
+
+
+@main.command(
+    context_settings={"ignore_unknown_options": True, "help_option_names": []},
     name="train-jepa-decoder",
 )
 @click.argument("args", nargs=-1)
@@ -126,19 +161,6 @@ def train_jepa_decoder(args):
     if "--train_mode" not in forwarded:
         forwarded = ["--train_mode", "jepa_decoder", *forwarded]
     main(forwarded)
-
-
-@main.command(
-    context_settings={"ignore_unknown_options": True, "help_option_names": []},
-    name="eval-jepa",
-)
-@click.argument("args", nargs=-1)
-def eval_jepa(args):
-    """Run JEPA research eval phases B–F."""
-    click.echo("loading, please wait...")
-    from perturbgen.jepa_eval import main
-
-    main(args)
 
 
 if __name__ == "__main__":
