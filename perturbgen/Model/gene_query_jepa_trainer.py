@@ -79,6 +79,8 @@ def sample_query_batch(
     n_queries: int,
     frac_shared: float,
     frac_tgt_only: float,
+    query_mode: str,
+    shared_max_queries: int,
     rng: random.Random,
 ) -> Dict[str, torch.Tensor]:
     """Build the per-cell quiz sheet. Returns CPU tensors, all shaped (B, Q).
@@ -91,6 +93,7 @@ def sample_query_batch(
       src_position    where the gene sits in src_input_ids, or -1 if the
                       source cell does not express it (used only for the
                       copy-source baseline metric)
+      is_valid        True for real queries, False for padded placeholders
 
     Worked example for one cell with n_queries=10:
       target genes  = {A, B, C, D, E}     source genes = {A, B, X, Y}
@@ -100,6 +103,10 @@ def sample_query_batch(
       absent decoys = rest of vocab minus {A..E} -> ask 10 - 5 = 5
     """
     batch_size = tgt_input_ids_local.size(0)
+    if query_mode not in {'mixed', 'all_shared'}:
+        raise ValueError(
+            f'unknown query_mode={query_mode!r}; expected "mixed" or "all_shared"'
+        )
 
     # Work on plain Python lists (fast enough, much easier to follow).
     src_rows = src_input_ids_global.detach().cpu().tolist()
@@ -115,6 +122,11 @@ def sample_query_batch(
     out_is_present: List[List[bool]] = []
     out_tgt_position: List[List[int]] = []
     out_src_position: List[List[int]] = []
+    out_is_valid: List[List[bool]] = []
+
+    per_cell_shared: List[List[int]] = []
+    per_cell_tgt_pos: List[Dict[int, int]] = []
+    per_cell_src_pos: List[Dict[int, int]] = []
 
     for cell in range(batch_size):
         # -- Which genes does the TARGET cell express, and where? ----------
@@ -138,6 +150,12 @@ def sample_query_batch(
         # -- Split the target's genes into the two present pools. ----------
         shared_pool = [g for g in tgt_gene_position if g in src_gene_position]
         tgt_only_pool = [g for g in tgt_gene_position if g not in src_gene_position]
+        per_cell_shared.append(shared_pool)
+        per_cell_tgt_pos.append(tgt_gene_position)
+        per_cell_src_pos.append(src_gene_position)
+
+        if query_mode == 'all_shared':
+            continue
 
         # -- Decide how many questions to take from each pool. -------------
         take_shared = min(len(shared_pool), n_shared_wanted)
@@ -182,17 +200,65 @@ def sample_query_batch(
             row_is_present.append(False)
             row_tgt_position.append(0)
             row_src_position.append(-1)
+        row_is_valid = [True] * n_queries
 
         out_gene_ids.append(row_gene_ids)
         out_is_present.append(row_is_present)
         out_tgt_position.append(row_tgt_position)
         out_src_position.append(row_src_position)
+        out_is_valid.append(row_is_valid)
+
+    if query_mode == 'all_shared':
+        max_shared = max((len(shared) for shared in per_cell_shared), default=0)
+        if shared_max_queries > 0:
+            max_shared = min(max_shared, shared_max_queries)
+        # Keep tensor shapes legal even if a batch has no shared genes.
+        max_shared = max(1, max_shared)
+
+        for cell in range(batch_size):
+            shared_pool = per_cell_shared[cell]
+            tgt_gene_position = per_cell_tgt_pos[cell]
+            src_gene_position = per_cell_src_pos[cell]
+
+            if len(shared_pool) > max_shared:
+                # Safety cap for memory-heavy settings; deterministic sampling
+                # comes from the trainer seed.
+                chosen_shared = rng.sample(shared_pool, max_shared)
+            else:
+                chosen_shared = shared_pool
+
+            row_gene_ids: List[int] = []
+            row_is_present: List[bool] = []
+            row_tgt_position: List[int] = []
+            row_src_position: List[int] = []
+            row_is_valid: List[bool] = []
+
+            for gene in chosen_shared:
+                row_gene_ids.append(gene)
+                row_is_present.append(True)
+                row_tgt_position.append(tgt_gene_position[gene])
+                row_src_position.append(src_gene_position[gene])
+                row_is_valid.append(True)
+
+            while len(row_gene_ids) < max_shared:
+                row_gene_ids.append(all_gene_local_ids[0])
+                row_is_present.append(False)
+                row_tgt_position.append(0)
+                row_src_position.append(-1)
+                row_is_valid.append(False)
+
+            out_gene_ids.append(row_gene_ids)
+            out_is_present.append(row_is_present)
+            out_tgt_position.append(row_tgt_position)
+            out_src_position.append(row_src_position)
+            out_is_valid.append(row_is_valid)
 
     return {
         'gene_ids_local': torch.tensor(out_gene_ids, dtype=torch.long),
         'is_present': torch.tensor(out_is_present, dtype=torch.bool),
         'tgt_position': torch.tensor(out_tgt_position, dtype=torch.long),
         'src_position': torch.tensor(out_src_position, dtype=torch.long),
+        'is_valid': torch.tensor(out_is_valid, dtype=torch.bool),
     }
 
 
@@ -255,6 +321,8 @@ class GeneQueryJEPATrainer(LightningModule):
         n_queries: int = 64,
         frac_shared: float = 0.5,
         frac_tgt_only: float = 0.3,
+        query_mode: str = 'mixed',
+        shared_max_queries: int = 0,
         predictor_layers: int = 2,
         # ---- loss weights (gene-primary, cell-auxiliary) ----
         lambda_gene: float = 1.0,
@@ -295,6 +363,8 @@ class GeneQueryJEPATrainer(LightningModule):
         self.n_queries = n_queries
         self.frac_shared = frac_shared
         self.frac_tgt_only = frac_tgt_only
+        self.query_mode = query_mode
+        self.shared_max_queries = int(shared_max_queries)
         self.lambda_gene = lambda_gene
         self.lambda_cell = lambda_cell
         self.lambda_contrastive = float(lambda_contrastive)
@@ -347,8 +417,9 @@ class GeneQueryJEPATrainer(LightningModule):
         )
         print(
             f'GeneQueryJEPA: encoder={jepa_encoder}, d_model={self.model.d_model}, '
-            f'n_queries={n_queries} (shared {frac_shared:.0%} / '
-            f'tgt-only {frac_tgt_only:.0%} / absent rest), '
+            f'n_queries={n_queries}, query_mode={query_mode}, '
+            f'(shared {frac_shared:.0%} / '
+            f'tgt-only {frac_tgt_only:.0%} / absent rest in mixed mode), '
             f'predictor_layers={predictor_layers}, '
             f'lambda_gene={lambda_gene}, lambda_cell={lambda_cell}, '
             f'lambda_contr={self.lambda_contrastive}, '
@@ -406,6 +477,8 @@ class GeneQueryJEPATrainer(LightningModule):
             n_queries=self.n_queries,
             frac_shared=self.frac_shared,
             frac_tgt_only=self.frac_tgt_only,
+            query_mode=self.query_mode,
+            shared_max_queries=self.shared_max_queries,
             rng=self.rng,
         )
         device = src_ids_global.device
@@ -413,6 +486,7 @@ class GeneQueryJEPATrainer(LightningModule):
         is_present = quiz['is_present'].to(device)                  # (B, Q)
         tgt_position = quiz['tgt_position'].to(device)              # (B, Q)
         src_position = quiz['src_position'].to(device)              # (B, Q)
+        is_valid = quiz['is_valid'].to(device)                      # (B, Q)
 
         # 2) Convert every id tensor into the encoder's id space.
         out = self.model.forward_one_timestep(
@@ -430,7 +504,7 @@ class GeneQueryJEPATrainer(LightningModule):
         per_query_distance = cosine_distance(
             out['z_hat_gene'], out['z_tgt_gene']
         )                                                           # (B, Q)
-        gene_loss = per_query_distance.mean()
+        gene_loss = masked_mean(per_query_distance, is_valid)
 
         # Cell loss: pooled prediction vs pooled target.
         cell_loss = cosine_distance(
@@ -443,7 +517,7 @@ class GeneQueryJEPATrainer(LightningModule):
             contrastive_loss = info_nce_present_genes(
                 z_hat=out['z_hat_gene'],
                 z_tgt=out['z_tgt_gene'],
-                is_present=is_present,
+                is_present=(is_present & is_valid),
                 temperature=self.contrastive_temperature,
             )
         else:
@@ -481,17 +555,18 @@ class GeneQueryJEPATrainer(LightningModule):
         # 4) Honesty metrics (no gradients needed). --------------------------
         with torch.no_grad():
             per_query_cosine = 1.0 - per_query_distance             # (B, Q)
-            gene_cos_pred = masked_mean(per_query_cosine, is_present)
+            valid_present = is_present & is_valid
+            gene_cos_pred = masked_mean(per_query_cosine, valid_present)
 
             # Static baseline: gene identity vector vs true embedding.
             static_cosine = F.cosine_similarity(
                 out['z_static_gene'], out['z_tgt_gene'], dim=-1
             )                                                       # (B, Q)
-            gene_cos_static = masked_mean(static_cosine, is_present)
+            gene_cos_static = masked_mean(static_cosine, valid_present)
 
             # Copy-source baseline, only where the gene exists in BOTH cells:
             # grab the gene's embedding out of the source cell and compare.
-            in_both = is_present & (src_position >= 0)              # (B, Q)
+            in_both = valid_present & (src_position >= 0)           # (B, Q)
             safe_position = src_position.clamp(min=0)               # (B, Q)
             index = safe_position.unsqueeze(-1).expand(
                 -1, -1, embedding_dim
@@ -527,6 +602,7 @@ class GeneQueryJEPATrainer(LightningModule):
             '_out': out,
             '_gene_ids_local': gene_ids_local,
             '_is_present': is_present,
+            '_is_valid': is_valid,
         }
 
     # ------------------------------------------------------------------
@@ -612,6 +688,8 @@ class GeneQueryJEPATrainer(LightningModule):
             out = result['_out']
             gene_ids = result['_gene_ids_local']          # (B, Q) LOCAL ids
             is_present = result['_is_present']            # (B, Q)
+            is_valid = result['_is_valid']                # (B, Q)
+            valid_present = is_present & is_valid
 
             # ---- accumulate per-gene running sums (present queries only) --
             for name, embeddings in (
@@ -624,8 +702,8 @@ class GeneQueryJEPATrainer(LightningModule):
                         vocab_size, self.model.d_model
                     )
                     self._test_gene_counts[key] = torch.zeros(vocab_size)
-                flat_ids = gene_ids[is_present].cpu()               # (n,)
-                flat_embeddings = embeddings[is_present].cpu()      # (n, D)
+                flat_ids = gene_ids[valid_present].cpu()            # (n,)
+                flat_embeddings = embeddings[valid_present].cpu()   # (n, D)
                 self._test_gene_sums[key].index_add_(
                     0, flat_ids, flat_embeddings.float()
                 )

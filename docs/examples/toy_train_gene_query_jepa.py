@@ -32,7 +32,8 @@ Env knobs (all optional):
     FREEZE_ENCODER=false  ENC_LAYERS=3
     VICREG_VAR=0.0  VICREG_COV=0.0          # VICReg optional (off by default)
     LAMBDA_CONTRASTIVE=0.3  CONTRASTIVE_TAU=0.1
-    LR=1e-4  N_QUERIES=64  PREDICTOR_LAYERS=1
+    LR=1e-4  N_QUERIES=64  QUERY_MODE=mixed  SHARED_MAX_QUERIES=0
+    PREDICTOR_LAYERS=1
 """
 
 import os
@@ -97,6 +98,8 @@ LAMBDA_CONTRASTIVE = float(os.environ.get('LAMBDA_CONTRASTIVE', 0.3))
 CONTRASTIVE_TAU = float(os.environ.get('CONTRASTIVE_TAU', 0.1))
 LR = float(os.environ.get('LR', 1e-4))
 N_QUERIES = int(os.environ.get('N_QUERIES', 64))
+QUERY_MODE = os.environ.get('QUERY_MODE', 'mixed')   # 'mixed' or 'all_shared'
+SHARED_MAX_QUERIES = int(os.environ.get('SHARED_MAX_QUERIES', 0))  # 0 = no cap
 PREDICTOR_LAYERS = int(os.environ.get('PREDICTOR_LAYERS', 1))
 USE_EARLY_STOP = os.environ.get('EARLY_STOP', 'true').lower() in ('true', '1')
 EARLY_STOP_PATIENCE = int(os.environ.get('EARLY_STOP_PATIENCE', 6))
@@ -232,6 +235,8 @@ def main() -> None:
         n_queries=N_QUERIES,
         frac_shared=0.5,
         frac_tgt_only=0.3,
+        query_mode=QUERY_MODE,
+        shared_max_queries=SHARED_MAX_QUERIES,
         lambda_gene=1.0,
         lambda_cell=0.1,
         lambda_contrastive=LAMBDA_CONTRASTIVE,
@@ -253,6 +258,8 @@ def main() -> None:
         f'freeze_encoder={FREEZE_ENCODER}, '
         f'predictor_layers={PREDICTOR_LAYERS}, '
         f'encoder_layers={ENC_LAYERS}, '
+        f'query_mode={QUERY_MODE}, '
+        f'shared_max_queries={SHARED_MAX_QUERIES}, '
         f'lambda_contr={LAMBDA_CONTRASTIVE}, '
         f'tau={CONTRASTIVE_TAU}, '
         f'vicreg_var={VICREG_VAR}, vicreg_cov={VICREG_COV}, '
