@@ -39,6 +39,10 @@ Activate the enviroment
 source "$(poetry env info -p)/bin/activate"
 ```
 
+Dependencies are declared in `pyproject.toml` (Poetry; source of truth with `poetry.lock`).
+`requirements.txt` is a readable list of **direct** packages only (not the full
+transitive tree). Pip fallback: `pip install -r requirements.txt`.
+
 ## Hardware requirements
 
 Preprocessing, tokenization, and inference notebooks run on CPU (a machine with
@@ -99,11 +103,13 @@ For usage, see the [documentation](https://perturbgen.cog.sanger.ac.uk/docs/exam
 - [Perturbation](docs/examples/06_perturbation.ipynb)
 - [Post Perturbation Analyses](docs/examples/07_PostPerturbation_Analyses.ipynb)
 
-**Gene-Query JEPA** (current JEPA design): see [docs/examples/GENE_QUERY_JEPA.md](docs/examples/GENE_QUERY_JEPA.md).
-Toy run: `python docs/examples/toy_train_gene_query_jepa.py`; full CLI:
+**Gene-Query JEPA** (toy or full, one script):
+see [docs/examples/GENE_QUERY_JEPA.md](docs/examples/GENE_QUERY_JEPA.md).
 
 ```shell
-python -m perturbgen train-jepa-gene-query --train_mode jepa_gene_query ...
+python docs/examples/train_gene_query_jepa.py --data toy --batches-per-type 2 --batch-size 16
+python docs/examples/train_gene_query_jepa.py --data full --split false
+bash docs/examples/run_gene_query_toy_sweep.sh
 ```
 
 See Perturbation notebook for more explaination about how to perturb a gene or list of genes

@@ -1,7 +1,12 @@
-"""scmaskgit-backed cell encoder for JEPA (pretrained MaskGIT source encoder).
+"""Gene-Query JEPA — pretrained MaskGIT encoder wrapper (production encoder).
 
-Kept separate from ``jepa.py`` so the lightweight ``CellEncoder`` path stays
-importable without scmaskgit.
+KEEP THIS FILE. Training and the hyperparameter sweep load this encoder
+(encoder_type='scmaskgit'). Time is discarded: pos_embedding(x, 1) only.
+Early-exit depth n_encoder_layers is a sweep knob (L in {1..6}).
+
+The tiny CPU encoder lives in jepa.py (tests only).
+Honesty metric: val/gene_gap_vs_copy_src > 0.
+Index: docs/examples/GENE_QUERY_JEPA.md
 """
 
 from __future__ import annotations

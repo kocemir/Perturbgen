@@ -1,16 +1,19 @@
-"""Training loop for Gene-Query JEPA (see Modules/gene_query_jepa.py for the model).
+"""Gene-Query JEPA trainer (Lightning). KEEP THIS FILE.
+
+Train:       docs/examples/train_gene_query_jepa.py (--data toy|full)
+HPO:         docs/examples/run_gene_query_toy_sweep.sh
+Honesty:     gene_gap_vs_copy_src must be > 0 (prediction beats copy-source).
+Index:       docs/examples/GENE_QUERY_JEPA.md
 
 WHAT HAPPENS EVERY TRAINING STEP (plain language)
 -------------------------------------------------
-1. The dataloader hands us a batch: source cells (90 min tokens) and their
-   pseudo-paired target cells at each later timepoint (t1, t2, t3).
+1. The dataloader hands us a batch: source cells (normal / resting tokens)
+   and their pseudo-paired target cells at each later timepoint (t1, t2, t3).
 2. For every cell and timepoint we SAMPLE GENE QUERIES — a quiz sheet of
-   ``n_queries`` genes per cell:
-      ~50%  genes present in BOTH source and target   (easy questions)
-      ~30%  genes present ONLY in the target           (induction — the
-                                                        interesting ones)
-      ~20%  genes absent from the target               (decoys; the right
-                                                        answer is "absent")
+   ``n_queries`` genes per cell, present at the target time only:
+      ~50%  genes present in BOTH source and target   (shared — shift)
+      ~50%  genes present ONLY in the target           (induced — birth)
+      leftover slots filled from the other present pool. No absent decoys.
 3. The model predicts each queried gene's embedding at the target time.
 4. Losses:  gene loss   = 1 - cosine(predicted, true)   ... main signal
             cell loss   = 1 - cosine(pooled prediction, pooled target)
@@ -95,12 +98,11 @@ def sample_query_batch(
                       copy-source baseline metric)
       is_valid        True for real queries, False for padded placeholders
 
-    Worked example for one cell with n_queries=10:
+    Worked example for one cell with n_queries=4:
       target genes  = {A, B, C, D, E}     source genes = {A, B, X, Y}
-      shared        = {A, B}         -> ask 5 (50%) but only 2 exist -> ask 2
-      target-only   = {C, D, E}      -> ask 3 (30%), all exist       -> ask 3
-      top-up: present quota was 8, we found 5, no more present genes exist
-      absent decoys = rest of vocab minus {A..E} -> ask 10 - 5 = 5
+      shared        = {A, B}         -> want 2, have 2
+      target-only   = {C, D, E}      -> want 2, have 3 -> ask 2
+      no absent decoys; leftover Q would be filled from leftover present genes
     """
     batch_size = tgt_input_ids_local.size(0)
     if query_mode not in {'mixed', 'all_shared'}:
@@ -113,7 +115,6 @@ def sample_query_batch(
     tgt_rows = tgt_input_ids_local.detach().cpu().tolist()
     global_to_local_list = global_to_local.detach().cpu().tolist()
 
-    all_genes_set = set(all_gene_local_ids)
     n_shared_wanted = round(frac_shared * n_queries)
     n_tgt_only_wanted = round(frac_tgt_only * n_queries)
 
@@ -160,47 +161,42 @@ def sample_query_batch(
         # -- Decide how many questions to take from each pool. -------------
         take_shared = min(len(shared_pool), n_shared_wanted)
         take_tgt_only = min(len(tgt_only_pool), n_tgt_only_wanted)
-        # If one pool was too small, top up from the other so the number
-        # of "present" questions stays as planned when possible.
-        present_quota = n_shared_wanted + n_tgt_only_wanted
-        missing = present_quota - (take_shared + take_tgt_only)
-        if missing > 0:
-            extra = min(missing, len(shared_pool) - take_shared)
-            take_shared += extra
-            missing -= extra
+        # Fill leftover Q from present pools only (no absent decoys).
+        missing = n_queries - (take_shared + take_tgt_only)
         if missing > 0:
             extra = min(missing, len(tgt_only_pool) - take_tgt_only)
             take_tgt_only += extra
-        n_absent = n_queries - take_shared - take_tgt_only
+            missing -= extra
+        if missing > 0:
+            extra = min(missing, len(shared_pool) - take_shared)
+            take_shared += extra
 
-        chosen_shared = rng.sample(shared_pool, take_shared)
-        chosen_tgt_only = rng.sample(tgt_only_pool, take_tgt_only)
-        absent_pool = list(all_genes_set - set(tgt_gene_position))
-        chosen_absent = rng.sample(absent_pool, min(n_absent, len(absent_pool)))
-        # (absent_pool is ~1700 genes, far more than we ever ask for.)
+        chosen_shared = (
+            rng.sample(shared_pool, take_shared) if take_shared else []
+        )
+        chosen_tgt_only = (
+            rng.sample(tgt_only_pool, take_tgt_only) if take_tgt_only else []
+        )
 
         # -- Write this cell's row of the quiz sheet. -----------------------
         row_gene_ids: List[int] = []
         row_is_present: List[bool] = []
         row_tgt_position: List[int] = []
         row_src_position: List[int] = []
+        row_is_valid: List[bool] = []
         for gene in chosen_shared + chosen_tgt_only:
             row_gene_ids.append(gene)
             row_is_present.append(True)
             row_tgt_position.append(tgt_gene_position[gene])
             row_src_position.append(src_gene_position.get(gene, -1))
-        for gene in chosen_absent:
-            row_gene_ids.append(gene)
-            row_is_present.append(False)
-            row_tgt_position.append(0)      # unused for absent queries
-            row_src_position.append(-1)
-        # Extremely rare corner case: pad the row if the vocab ran dry.
+            row_is_valid.append(True)
+        # Pad only if this cell has fewer present genes than Q.
         while len(row_gene_ids) < n_queries:
             row_gene_ids.append(all_gene_local_ids[0])
             row_is_present.append(False)
             row_tgt_position.append(0)
             row_src_position.append(-1)
-        row_is_valid = [True] * n_queries
+            row_is_valid.append(False)
 
         out_gene_ids.append(row_gene_ids)
         out_is_present.append(row_is_present)
@@ -320,7 +316,7 @@ class GeneQueryJEPATrainer(LightningModule):
         # ---- query sampling ----
         n_queries: int = 64,
         frac_shared: float = 0.5,
-        frac_tgt_only: float = 0.3,
+        frac_tgt_only: float = 0.5,
         query_mode: str = 'mixed',
         shared_max_queries: int = 0,
         predictor_layers: int = 2,
@@ -495,12 +491,12 @@ class GeneQueryJEPATrainer(LightningModule):
             query_gene_ids=self._local_ids_to_encoder_space(gene_ids_local),
             query_is_present=is_present,
             query_tgt_position=tgt_position,
+            query_src_position=src_position,
             time_step=time_step,
         )
 
         # 3) Losses. -------------------------------------------------------
-        # Gene loss: every query counts — present genes must match the EMA
-        # embedding, absent decoys must match the learned "absent" vector.
+        # Gene loss: valid queries only (present genes vs EMA target row).
         per_query_distance = cosine_distance(
             out['z_hat_gene'], out['z_tgt_gene']
         )                                                           # (B, Q)

@@ -1,9 +1,15 @@
-"""Gene-Query JEPA: predict target-time GENE embeddings, not just cell embeddings.
+"""Gene-Query JEPA model: predict target-time GENE embeddings (not a cell vector).
+
+KEEP THIS FILE. This is the only JEPA architecture we train.
+Train: docs/examples/train_gene_query_jepa.py (--data toy|full)
+Hyperparameter search: docs/examples/run_gene_query_toy_sweep.sh
+Honesty metric: val/gene_gap_vs_copy_src must be > 0 (beats copy-source).
+Index: docs/examples/GENE_QUERY_JEPA.md
 
 WHY THIS MODEL EXISTS (plain language)
 --------------------------------------
-The first JEPA (``jepa.py``) squeezed each cell into ONE vector and predicted
-the future cell vector. That answers "where does the cell go?" but can never
+A cell-pooled JEPA would squeeze each cell into ONE vector and predict the
+future cell vector. That answers "where does the cell go?" but can never
 answer "what happens to gene IL1B at 6 hours?" — the gene axis was averaged
 away before prediction ever happened.
 
@@ -13,16 +19,17 @@ This model keeps the gene axis. The predictor is asked, gene by gene:
      Tell me what that gene's contextual embedding will look like at
      the target time."
 
-Genes it must handle include ones NOT expressed in the source cell (newly
-induced genes — biologically the most interesting) and decoys that will not
-be expressed at all (it should answer "absent" via a learned null vector).
+Queries are only genes present at the target time: shared (also in the
+source / normal cell) and target-only (induced). No absent decoys.
+Each query gets its own time vector. Shared: DCT shift of H_src[g].
+Target-only: DCT gain on the gene-name vector e(g).
 
 THE PICTURE (matches the architecture PDF + our discussion)
 -----------------------------------------------------------
 
       ONLINE SIDE (gets gradients)                EMA SIDE (frozen copy, no grad)
 
-  src tokens (e.g. 90 min) --> encoder            tgt tokens (e.g. 6 h)
+  src tokens (normal) --> encoder                 tgt tokens (90m / 6h / 10h)
              |                                              |
              v                                              v
    gene embeddings H_src                            EMA encoder
@@ -31,9 +38,9 @@ THE PICTURE (matches the architecture PDF + our discussion)
    [H_src ; population context] --> linear      gene embeddings H_tgt
              |         (768*2 -> 768)           (batch, tgt_len, 768) stop-grad
              v                                              |
-        PREDICTOR  <-- queries = "gene name"                |
-   (small transformer,     embeddings + time                |
-    cross-attention)                                        |
+        PREDICTOR  <-- per-query time:                      |
+   (transformer decoder)  shared:  H_src[g] + DCT_shift_g(t)|
+                          induced: e(g) ⊙ σ(DCT_gain_g(t))  |
              |                                              |
              v                                              v
    predicted gene embeddings  ---- gene loss ---->  true gene embeddings
@@ -63,6 +70,7 @@ Terminology used everywhere in this file:
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Literal, Optional
 
 import torch
@@ -71,6 +79,11 @@ import torch.nn.functional as F
 
 # Token id 0 means "padding" in BOTH id spaces (global and local).
 PAD_TOKEN_ID = 0
+
+# LPS hours for predictor time_step 1/2/3. Unused index 0 -> 0 h.
+TIME_STEP_HOURS = {0: 0.0, 1: 1.5, 2: 6.0, 3: 10.0}
+DCT_T_MAX = 10.0
+DCT_N_BASIS = 2
 
 
 class PopulationContext(nn.Module):
@@ -119,31 +132,77 @@ class PopulationContext(nn.Module):
         return self.mix(combined)                            # (B, Ls, D)
 
 
-class GeneQueryPredictor(nn.Module):
-    """Answer gene questions about the future.
+class DCTQueryBuilder(nn.Module):
+    """Per-query time vectors on a K=2 DCT clock (hours 1.5 / 6 / 10).
 
-    Each query is built from two ingredients:
-      * WHICH gene we are asking about  -> that gene's identity embedding
-        (the same embedding table the encoder uses for its input tokens)
-      * WHEN we are asking about        -> a learned time embedding
+    Shared (gene in source and target) — quantify the shift:
+        q_g(t) = H_src[g] + Σ_k (W_k H_src[g]) φ_k(t)
 
-    The queries then cross-attend to the source cell's (context-enriched)
-    gene embeddings and each query returns one predicted embedding.
-    This is a standard transformer decoder; queries also see each other
-    through self-attention, which lets predictions stay mutually consistent.
+    Target-only (induced) — open the name prototype, do not shift:
+        q_g(t) = e(g) ⊙ σ( Σ_k (U_k e(g)) φ_k(t) )
+
+    φ_k(t) = cos(π k t / T), T=10, K=2. W_k and U_k are separate.
     """
 
     def __init__(
         self,
         d_model: int,
-        n_time_steps: int,
+        n_basis: int = DCT_N_BASIS,
+        t_max: float = DCT_T_MAX,
+    ):
+        super().__init__()
+        self.n_basis = int(n_basis)
+        self.t_max = float(t_max)
+        self.shared_maps = nn.ModuleList(
+            [nn.Linear(d_model, d_model, bias=False) for _ in range(self.n_basis)]
+        )
+        self.induced_maps = nn.ModuleList(
+            [nn.Linear(d_model, d_model, bias=False) for _ in range(self.n_basis)]
+        )
+
+    def basis(self, time_step: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        t_hours = float(TIME_STEP_HOURS.get(int(time_step), 0.0))
+        k = torch.arange(self.n_basis, device=device, dtype=dtype)
+        return torch.cos(math.pi * k * t_hours / self.t_max)
+
+    def forward(
+        self,
+        h_src_at_query: torch.Tensor,   # (B, Q, D) source row; dummy if not shared
+        identity: torch.Tensor,         # (B, Q, D) e(g)
+        is_shared: torch.Tensor,        # (B, Q) bool
+        time_step: int,
+    ) -> torch.Tensor:
+        phi = self.basis(time_step, identity.device, identity.dtype)  # (K,)
+
+        shift = torch.zeros_like(h_src_at_query)
+        for k, layer in enumerate(self.shared_maps):
+            shift = shift + phi[k] * layer(h_src_at_query)
+        q_shared = h_src_at_query + shift
+
+        pre_gain = torch.zeros_like(identity)
+        for k, layer in enumerate(self.induced_maps):
+            pre_gain = pre_gain + phi[k] * layer(identity)
+        q_induced = identity * torch.sigmoid(pre_gain)
+
+        return torch.where(is_shared.unsqueeze(-1), q_shared, q_induced)
+
+
+class GeneQueryPredictor(nn.Module):
+    """Answer gene questions about the future.
+
+    Builds a type-specific query (DCT shift vs DCT gain), then cross-attends
+    to the source cell. Queries also see each other through self-attention.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
         num_layers: int = 2,
         num_heads: int = 8,
         dropout: float = 0.0,
     ):
         super().__init__()
-        # One learned vector per target timepoint (plus index 0 = source).
-        self.time_embedding = nn.Embedding(n_time_steps + 1, d_model)
+        self.query_time = DCTQueryBuilder(d_model)
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
             nhead=num_heads,
@@ -160,22 +219,20 @@ class GeneQueryPredictor(nn.Module):
 
     def forward(
         self,
-        query_gene_embeddings: torch.Tensor,  # (B, Q, D)  "which gene?"
-        time_step: int,                       # scalar     "when?"
-        source_memory: torch.Tensor,          # (B, Ls, D) context-enriched source
-        source_is_padding: torch.Tensor,      # (B, Ls)    True where src is padding
+        h_src_at_query: torch.Tensor,         # (B, Q, D)
+        identity: torch.Tensor,               # (B, Q, D)
+        is_shared: torch.Tensor,              # (B, Q)
+        time_step: int,
+        source_memory: torch.Tensor,          # (B, Ls, D)
+        source_is_padding: torch.Tensor,      # (B, Ls)
     ) -> torch.Tensor:
-        # Add "when" to every query. All queries in a call share one time.
-        time_index = torch.tensor(
-            [time_step], device=query_gene_embeddings.device
+        queries = self.query_time(
+            h_src_at_query, identity, is_shared, time_step
         )
-        time_vector = self.time_embedding(time_index)         # (1, D)
-        queries = query_gene_embeddings + time_vector         # (B, Q, D)
-
         predicted = self.cross_attention(
-            tgt=queries,                                     # what we ask
-            memory=source_memory,                            # what we look at
-            memory_key_padding_mask=source_is_padding,       # ignore padding
+            tgt=queries,
+            memory=source_memory,
+            memory_key_padding_mask=source_is_padding,
         )
         return predicted                                      # (B, Q, D)
 
@@ -266,17 +323,14 @@ class GeneQueryJEPA(nn.Module):
         # ------------------------------------------------------------------
         self.predictor = GeneQueryPredictor(
             d_model=self.d_model,
-            n_time_steps=n_time_steps,
             num_layers=predictor_layers,
             num_heads=predictor_heads,
             dropout=dropout,
         )
 
         # ------------------------------------------------------------------
-        # 4) The learned "this gene is absent" answer. When we query a gene
-        #    that is NOT expressed at the target time, the correct answer is
-        #    this vector. Small random init (an all-zero vector has no
-        #    direction, which would break cosine similarity).
+        # 4) Fallback vector for padded (invalid) query slots only.
+        # Mixed sampling has no absent decoys; this is just a shape filler.
         # ------------------------------------------------------------------
         self.absent_gene_embedding = nn.Parameter(
             torch.randn(self.d_model) * 0.02
@@ -322,13 +376,14 @@ class GeneQueryJEPA(nn.Module):
         query_gene_ids: torch.Tensor,     # (B, Q)  which genes we ask about
         query_is_present: torch.Tensor,   # (B, Q)  True if gene really is in tgt
         query_tgt_position: torch.Tensor, # (B, Q)  where in tgt_input_ids it sits
+        query_src_position: torch.Tensor, # (B, Q)  where in src, or -1 if induced
         time_step: int,                   # which target timepoint (1, 2 or 3)
     ) -> Dict[str, torch.Tensor]:
         """Run the whole diagram once. Returns every arrow's endpoint.
 
         All id tensors must already be in the id space the encoder expects
         (the trainer takes care of converting; see the trainer docstring).
-        For absent queries, query_tgt_position is 0 and simply unused.
+        For padded invalid queries, query_tgt_position is 0 and unused.
         """
         # ---- Step 1: online encoder reads the source cell. -----------------
         online_out = self.online_encoder(src_input_ids, time_step=0)
@@ -348,38 +403,34 @@ class GeneQueryJEPA(nn.Module):
             h_tgt = target_out['token_embedding']       # (B, Lt, D)
             z_tgt_cell = target_out['cell_embedding']   # (B, D)
 
-        # ---- Step 4: collect the true answer for every query. --------------
-        # For a present gene: its contextual embedding at the target time,
-        # picked out of h_tgt at the recorded position.
-        # For an absent gene: the learned "absent" vector.
+        # ---- Step 4: true answer = that gene's row in H_tgt (or pad fill). -
         batch_size, n_queries = query_gene_ids.shape
         position_as_index = query_tgt_position.unsqueeze(-1)     # (B, Q, 1)
         position_as_index = position_as_index.expand(-1, -1, self.d_model)
         true_gene_embedding = torch.gather(h_tgt, dim=1, index=position_as_index)
-        #                                                (B, Q, D)
         absent_answer = self.absent_gene_embedding.expand(
             batch_size, n_queries, self.d_model
-        )                                               # (B, Q, D)
+        )
         is_present = query_is_present.unsqueeze(-1)     # (B, Q, 1)
         z_tgt_gene = torch.where(is_present, true_gene_embedding, absent_answer)
-        # Present targets come from the EMA encoder and must stay gradient-free;
-        # the absent vector is a trainable parameter, so DON'T detach the whole
-        # tensor — only the present part is already detached (built under
-        # no_grad above).
 
-        # ---- Step 5: build the queries and predict. -------------------------
-        # "Which gene?" -> identity embedding from the online encoder's table.
+        # ---- Step 5: per-query DCT time, then predict. ---------------------
+        is_shared = query_src_position >= 0
+        safe_src = query_src_position.clamp(min=0)
+        src_index = safe_src.unsqueeze(-1).expand(-1, -1, self.d_model)
+        h_src_at_query = torch.gather(h_src, dim=1, index=src_index)
         identity_table = self._gene_identity_table(self.online_encoder)
-        query_gene_embeddings = identity_table(query_gene_ids)  # (B, Q, D)
+        identity = identity_table(query_gene_ids)              # (B, Q, D)
         z_hat_gene = self.predictor(
-            query_gene_embeddings=query_gene_embeddings,
+            h_src_at_query=h_src_at_query,
+            identity=identity,
+            is_shared=is_shared,
             time_step=time_step,
             source_memory=source_memory,
             source_is_padding=source_is_padding,
         )                                               # (B, Q, D)
 
         # ---- Step 6: cell-level view = average over the present queries. ---
-        # (Absent decoys are excluded: they describe what the cell is NOT.)
         present_mask = query_is_present.unsqueeze(-1).float()    # (B, Q, 1)
         n_present = present_mask.sum(dim=1).clamp(min=1.0)       # (B, 1)
         z_hat_cell = (z_hat_gene * present_mask).sum(dim=1) / n_present  # (B, D)
@@ -392,10 +443,6 @@ class GeneQueryJEPA(nn.Module):
         z_src_cell = self._maybe_normalize(z_src_cell)
 
         # ---- Step 8 (metrics only): the "no learning" baselines. -----------
-        # a) copy-source baseline: the gene's embedding in the SOURCE cell
-        #    (computed by the trainer from h_src, returned here for gathering)
-        # b) static baseline: the gene's context-free identity vector from
-        #    the EMA table — what you'd predict knowing only the gene's name.
         with torch.no_grad():
             static_table = self._gene_identity_table(self.target_encoder)
             z_static_gene = self._maybe_normalize(

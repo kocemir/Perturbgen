@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-# TOY systematic sweep for Gene-Query JEPA — 144 runs, all 8 GPUs
+# Gene-Query JEPA — hyperparameter search (KEEP THIS FILE)
 # =============================================================================
+# Small-scale 144-run sweep. Wraps train_gene_query_jepa.py --data toy.
+# Honesty metric: val/gene_gap_vs_copy_src must be > 0.
 # Index: docs/examples/GENE_QUERY_JEPA.md
 #
 # Data: TOY roster (~480 cells: 2 batches x 16 per cell type), train=val=same
@@ -22,7 +24,7 @@
 #
 # Output: /mnt/sod2-project/csb4/stuke1/perturbgen/gene_query_jepa/toy_runs/
 #           systematic_144/<run_id>/{hparams.env, train.log, DONE,
-#                                    toy_logs/version_0/metrics.csv,
+#                                    logs/version_0/metrics.csv,
 #                                    checkpoints/*.ckpt}
 #         + grid_manifest.tsv, status.tsv, suite_*.log at the suite root.
 #
@@ -170,6 +172,7 @@ run_one() {
 
   mkdir -p "${OUT_DIR}"
   cat > "${OUT_DIR}/hparams.env" <<EOF
+DATA=toy
 DATASET=TOY_480_cells
 RUN_ID=${RUN_ID}
 FREEZE_ENCODER=${FREEZE}
@@ -192,26 +195,27 @@ EOF
   echo ">> START gpu=${GPU} ${RUN_ID}"
 
   set +e
-  TOY_GPU="${GPU}" \
-  TOY_OUT="${OUT_DIR}" \
-  FREEZE_ENCODER="${FREEZE}" \
-  VICREG_VAR="${VIC_VAR}" \
-  VICREG_COV="${VIC_COV}" \
-  LAMBDA_CONTRASTIVE="${LAMBDA_CONTR}" \
-  CONTRASTIVE_TAU="${CONTR_TAU}" \
-  N_QUERIES="${Q}" \
-  ENC_LAYERS="${L}" \
-  PREDICTOR_LAYERS="${PREDICTOR_LAYERS}" \
-  EPOCHS="${EPOCHS}" \
-  EARLY_STOP="${EARLY_STOP}" \
-  LR="${LR}" \
-  BATCH_SIZE="${BATCH_SIZE}" \
-  BATCHES_PER_TYPE="${BATCHES_PER_TYPE}" \
-  SAVE_CKPT="${SAVE_CKPT}" \
-  CKPT_TOP_K="${CKPT_TOP_K}" \
-  CKPT_SAVE_LAST="${CKPT_SAVE_LAST}" \
-  CKPT_WEIGHTS_ONLY="${CKPT_WEIGHTS_ONLY}" \
-  python -u docs/examples/toy_train_gene_query_jepa.py \
+  python -u docs/examples/train_gene_query_jepa.py \
+    --data toy \
+    --gpu "${GPU}" \
+    --output-dir "${OUT_DIR}" \
+    --freeze-encoder "${FREEZE}" \
+    --vicreg-var "${VIC_VAR}" \
+    --vicreg-cov "${VIC_COV}" \
+    --lambda-contrastive "${LAMBDA_CONTR}" \
+    --contrastive-tau "${CONTR_TAU}" \
+    --n-queries "${Q}" \
+    --encoder-layers "${L}" \
+    --predictor-layers "${PREDICTOR_LAYERS}" \
+    --epochs "${EPOCHS}" \
+    --early-stop "${EARLY_STOP}" \
+    --lr "${LR}" \
+    --batch-size "${BATCH_SIZE}" \
+    --batches-per-type "${BATCHES_PER_TYPE}" \
+    --save-ckpt "${SAVE_CKPT}" \
+    --ckpt-top-k "${CKPT_TOP_K}" \
+    --ckpt-save-last "${CKPT_SAVE_LAST}" \
+    --ckpt-weights-only "${CKPT_WEIGHTS_ONLY}" \
     > "${OUT_DIR}/train.log" 2>&1
   rc=$?
   set -e

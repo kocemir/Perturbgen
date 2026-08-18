@@ -15,8 +15,6 @@ from pytorch_lightning.strategies import DDPStrategy, DeepSpeedStrategy
 
 from perturbgen.configs import ROOT
 from perturbgen.Dataloaders.datamodule import PerturbGenDataModule
-from perturbgen.Model.gene_query_jepa_trainer import GeneQueryJEPATrainer
-from perturbgen.Model.jepa_trainer import JEPADecoderTrainer, JEPATrainer
 from perturbgen.Model.trainer import CountDecoderTrainer, PerturbGenTrainer
 from perturbgen.src.utils import (
     condition_for_count_loss,
@@ -67,135 +65,7 @@ def get_args(args=None):
         '--train_mode',
         type=str,
         default='masking',
-        help='Mode [masking, count, jepa, jepa_decoder, jepa_gene_query]',
-    )
-    parser.add_argument(
-        '--ema_decay',
-        type=float,
-        default=0.996,
-        help='EMA decay for JEPA target encoder',
-    )
-    parser.add_argument(
-        '--jepa_loss',
-        type=str,
-        default='mse',
-        choices=['mse', 'smooth_l1', 'cosine'],
-        help='Latent loss for JEPA training: mse | smooth_l1 | cosine '
-        '(cosine minimizes 1-cos, i.e. maximizes cosine similarity)',
-    )
-    parser.add_argument(
-        '--vicreg_var_coeff',
-        type=float,
-        default=0.0,
-        help='VICReg variance coefficient (0 disables); anti-collapse regularizer',
-    )
-    parser.add_argument(
-        '--vicreg_cov_coeff',
-        type=float,
-        default=0.0,
-        help='VICReg covariance coefficient (0 disables); decorrelates dims',
-    )
-    parser.add_argument(
-        '--vicreg_gamma',
-        type=float,
-        default=None,
-        help='VICReg variance target std; default 1/sqrt(D) if normalize_latents else 1',
-    )
-    parser.add_argument(
-        '--normalize_latents',
-        type=str2bool,
-        default=True,
-        help='L2-normalize JEPA latents before loss',
-    )
-    parser.add_argument(
-        '--ckpt_jepa_path',
-        type=str,
-        default=None,
-        help='JEPA checkpoint for jepa_decoder fine-tuning',
-    )
-    parser.add_argument(
-        '--freeze_jepa',
-        type=str2bool,
-        default=True,
-        help='Freeze JEPA backbone when training jepa_decoder',
-    )
-    parser.add_argument(
-        '--jepa_encoder',
-        type=str,
-        default='scmaskgit',
-        choices=['scmaskgit', 'cell'],
-        help=(
-            'JEPA context/target encoder: pretrained MaskGIT source encoder '
-            '(scmaskgit) or lightweight CellEncoder (cell)'
-        ),
-    )
-    parser.add_argument(
-        '--freeze_jepa_encoder',
-        type=str2bool,
-        default=False,
-        help='Freeze JEPA context encoder; train predictor (and unfrozen parts) only',
-    )
-    parser.add_argument(
-        '--jepa_encoder_layers',
-        type=int,
-        default=3,
-        help=(
-            'For jepa_encoder=scmaskgit: run only the first N pretrained '
-            'transformer blocks (early exit). Heads/width stay as in ckpt.'
-        ),
-    )
-    # ---- Gene-Query JEPA (train_mode=jepa_gene_query) --------------------
-    parser.add_argument(
-        '--gq_n_queries',
-        type=int,
-        default=64,
-        help='Gene-Query JEPA: number of gene questions per cell per timepoint',
-    )
-    parser.add_argument(
-        '--gq_frac_shared',
-        type=float,
-        default=0.5,
-        help='Gene-Query JEPA: fraction of queries for genes in BOTH src and tgt',
-    )
-    parser.add_argument(
-        '--gq_frac_tgt_only',
-        type=float,
-        default=0.3,
-        help='Gene-Query JEPA: fraction of queries for genes ONLY in tgt '
-        '(the rest are absent decoys)',
-    )
-    parser.add_argument(
-        '--gq_lambda_gene',
-        type=float,
-        default=1.0,
-        help='Gene-Query JEPA: weight of the per-gene loss (primary)',
-    )
-    parser.add_argument(
-        '--gq_lambda_cell',
-        type=float,
-        default=0.1,
-        help='Gene-Query JEPA: weight of the pooled cell loss (auxiliary)',
-    )
-    parser.add_argument(
-        '--gq_predictor_layers',
-        type=int,
-        default=2,
-        help='Gene-Query JEPA: number of transformer decoder layers in predictor',
-    )
-    parser.add_argument(
-        '--gq_lambda_contrastive',
-        type=float,
-        default=0.3,
-        help=(
-            'Gene-Query JEPA: InfoNCE weight on present gene queries '
-            '(0 disables contrastive anti-collapse)'
-        ),
-    )
-    parser.add_argument(
-        '--gq_contrastive_temperature',
-        type=float,
-        default=0.1,
-        help='Gene-Query JEPA: InfoNCE temperature for present-gene contrastive',
+        help='Mode [masking, count]',
     )
     parser.add_argument(
         '--parallel_distribution',
@@ -653,64 +523,9 @@ def main(argv=None) -> None:
         trainer_kwargs['n_genes'] = src_adata.shape[1]
         trainer_kwargs['dropout'] = args.count_dropout
         decoder_module = CountDecoderTrainer(**trainer_kwargs)
-    elif args.train_mode == 'jepa':
-        trainer_kwargs['dropout'] = args.cellgen_dropout
-        trainer_kwargs['lr'] = args.cellgen_lr
-        trainer_kwargs['weight_decay'] = args.cellgen_wd
-        trainer_kwargs['ema_decay'] = args.ema_decay
-        trainer_kwargs['normalize_latents'] = args.normalize_latents
-        trainer_kwargs['loss_type'] = args.jepa_loss
-        trainer_kwargs['vicreg_var_coeff'] = args.vicreg_var_coeff
-        trainer_kwargs['vicreg_cov_coeff'] = args.vicreg_cov_coeff
-        trainer_kwargs['vicreg_gamma'] = args.vicreg_gamma
-        trainer_kwargs['ckpt_masking_path'] = args.ckpt_masking_path
-        trainer_kwargs['jepa_encoder'] = args.jepa_encoder
-        trainer_kwargs['freeze_jepa_encoder'] = args.freeze_jepa_encoder
-        trainer_kwargs['jepa_encoder_layers'] = args.jepa_encoder_layers
-        trainer_kwargs['var_list'] = args.var_list
-        pretrained_module = JEPATrainer(**trainer_kwargs)
-    elif args.train_mode == 'jepa_decoder':
-        trainer_kwargs['dropout'] = args.count_dropout
-        trainer_kwargs['lr'] = args.count_lr
-        trainer_kwargs['weight_decay'] = args.count_wd
-        trainer_kwargs['ema_decay'] = args.ema_decay
-        trainer_kwargs['normalize_latents'] = args.normalize_latents
-        trainer_kwargs['ckpt_masking_path'] = args.ckpt_masking_path
-        trainer_kwargs['ckpt_jepa_path'] = args.ckpt_jepa_path
-        trainer_kwargs['freeze_jepa'] = args.freeze_jepa
-        trainer_kwargs['jepa_encoder'] = args.jepa_encoder
-        trainer_kwargs['freeze_jepa_encoder'] = args.freeze_jepa_encoder
-        trainer_kwargs['jepa_encoder_layers'] = args.jepa_encoder_layers
-        trainer_kwargs['n_genes'] = src_adata.shape[1]
-        decoder_module = JEPADecoderTrainer(**trainer_kwargs)
-    elif args.train_mode == 'jepa_gene_query':
-        trainer_kwargs['dropout'] = args.cellgen_dropout
-        trainer_kwargs['lr'] = args.cellgen_lr
-        trainer_kwargs['weight_decay'] = args.cellgen_wd
-        trainer_kwargs['ema_decay'] = args.ema_decay
-        trainer_kwargs['normalize_latents'] = args.normalize_latents
-        trainer_kwargs['vicreg_var_coeff'] = args.vicreg_var_coeff
-        trainer_kwargs['vicreg_cov_coeff'] = args.vicreg_cov_coeff
-        trainer_kwargs['vicreg_gamma'] = args.vicreg_gamma
-        trainer_kwargs['jepa_encoder'] = args.jepa_encoder
-        trainer_kwargs['freeze_jepa_encoder'] = args.freeze_jepa_encoder
-        trainer_kwargs['jepa_encoder_layers'] = args.jepa_encoder_layers
-        trainer_kwargs['n_queries'] = args.gq_n_queries
-        trainer_kwargs['frac_shared'] = args.gq_frac_shared
-        trainer_kwargs['frac_tgt_only'] = args.gq_frac_tgt_only
-        trainer_kwargs['lambda_gene'] = args.gq_lambda_gene
-        trainer_kwargs['lambda_cell'] = args.gq_lambda_cell
-        trainer_kwargs['predictor_layers'] = args.gq_predictor_layers
-        trainer_kwargs['lambda_contrastive'] = args.gq_lambda_contrastive
-        trainer_kwargs['contrastive_temperature'] = (
-            args.gq_contrastive_temperature
-        )
-        trainer_kwargs['var_list'] = args.var_list
-        pretrained_module = GeneQueryJEPATrainer(**trainer_kwargs)
     else:
         raise ValueError(
-            'train_mode not recognised, needs to be '
-            'masking, count, jepa, jepa_decoder, or jepa_gene_query'
+            'train_mode not recognised, needs to be masking or count'
         )
     # Initialize data module
     # ----------------------------------------------------------------------------------
@@ -745,7 +560,7 @@ def main(argv=None) -> None:
         'sampling_keys': args.sampling_keys,
         'seed': 42, # fix seed for shuffling for reproducibility
     }
-    if args.train_mode in ('masking', 'jepa', 'jepa_gene_query'):
+    if args.train_mode == 'masking':
         # TODO: Do not pass src into DataModule
         data_module = PerturbGenDataModule(**data_module_kwargs)
 
@@ -756,10 +571,6 @@ def main(argv=None) -> None:
         data_module_kwargs['condition_encodings'] = condition_encodings
         data_module_kwargs['conditions'] = conditions
         data_module_kwargs['conditions_combined'] = conditions_combined
-        data_module = PerturbGenDataModule(**data_module_kwargs)
-    elif args.train_mode == 'jepa_decoder':
-        data_module_kwargs['src_counts'] = src_counts
-        data_module_kwargs['tgt_counts_dict'] = tgt_counts_dict
         data_module = PerturbGenDataModule(**data_module_kwargs)
     else:
         raise ValueError(
@@ -803,86 +614,11 @@ def main(argv=None) -> None:
         else:
             monitor_metric = 'train/mse'
             mode = 'min'
-    elif args.train_mode == 'jepa':
-        # Encode optional JEPA choices so runs are distinguishable on disk.
-        enc_tag = f'enc_{args.jepa_encoder}'
-        if args.jepa_encoder == 'scmaskgit':
-            enc_tag += f'_L{args.jepa_encoder_layers}'
-        freeze_tag = 'fz' if args.freeze_jepa_encoder else 'unfz'
-        opt_tags = [f'loss_{args.jepa_loss}']
-        if args.vicreg_var_coeff and args.vicreg_var_coeff > 0:
-            opt_tags.append(f'vicv_{args.vicreg_var_coeff:g}')
-        if args.vicreg_cov_coeff and args.vicreg_cov_coeff > 0:
-            opt_tags.append(f'vicc_{args.vicreg_cov_coeff:g}')
-        if not args.normalize_latents:
-            opt_tags.append('unnorm')
-        opt_suffix = '_'.join(opt_tags)
-        filename = (
-            f'{run_id}_train_{args.train_mode}_lr_{args.cellgen_lr}'
-            f'_wd_{args.cellgen_wd}_batch_{args.batch_size}_'
-            f'{enc_tag}_{freeze_tag}_{opt_suffix}'
-            f'_ema_{args.ema_decay}_p{args.pos_encoding_mode}'
-            f'_tp_{time_steps_str}_s_{args.seed}'
-        )
-        monitor_metric = (
-            'val/jepa_loss' if val_indices is not None else 'train/jepa_loss'
-        )
-        mode = 'min'
-    elif args.train_mode == 'jepa_gene_query':
-        enc_tag = f'enc_{args.jepa_encoder}'
-        if args.jepa_encoder == 'scmaskgit':
-            enc_tag += f'_L{args.jepa_encoder_layers}'
-        freeze_tag = 'fz' if args.freeze_jepa_encoder else 'unfz'
-        contr_tag = (
-            f'_contr{args.gq_lambda_contrastive:g}'
-            if args.gq_lambda_contrastive and args.gq_lambda_contrastive > 0
-            else '_contr0'
-        )
-        vic_tag = ''
-        if args.vicreg_var_coeff and args.vicreg_var_coeff > 0:
-            vic_tag += f'_vicv{args.vicreg_var_coeff:g}'
-        if args.vicreg_cov_coeff and args.vicreg_cov_coeff > 0:
-            vic_tag += f'_vicc{args.vicreg_cov_coeff:g}'
-        filename = (
-            f'{run_id}_train_{args.train_mode}_lr_{args.cellgen_lr}'
-            f'_wd_{args.cellgen_wd}_batch_{args.batch_size}_'
-            f'{enc_tag}_{freeze_tag}'
-            f'_q{args.gq_n_queries}'
-            f'_predL{args.gq_predictor_layers}'
-            f'_lg{args.gq_lambda_gene:g}_lc{args.gq_lambda_cell:g}'
-            f'{contr_tag}{vic_tag}'
-            f'_ema_{args.ema_decay}'
-            f'_tp_{time_steps_str}_s_{args.seed}'
-        )
-        monitor_metric = (
-            'val/total_loss' if val_indices is not None else 'train/total_loss'
-        )
-        mode = 'min'
-    elif args.train_mode == 'jepa_decoder':
-        enc_tag = f'enc_{args.jepa_encoder}'
-        if args.jepa_encoder == 'scmaskgit':
-            enc_tag += f'_L{args.jepa_encoder_layers}'
-        fz_enc = 'fzenc' if args.freeze_jepa_encoder else 'unfzenc'
-        fz_jepa = 'fzjepa' if args.freeze_jepa else 'unfzjepa'
-        filename = (
-            f'{run_id}_train_{args.train_mode}_lr_{args.count_lr}'
-            f'_wd_{args.count_wd}_batch_{args.batch_size}_'
-            f'{enc_tag}_{fz_enc}_{fz_jepa}_'
-            f'tp_{time_steps_str}_s_{args.seed}'
-        )
-        monitor_metric = 'val/mse' if val_indices else 'train/mse'
-        mode = 'min'
     else:
         raise ValueError(f'Unknown train_mode for checkpoint naming: {args.train_mode}')
 
     checkpoint_path = os.path.join(args.output_dir, 'checkpoints')
-    # JEPA: one folder per hyperparam recipe so optional choices are visible
-    # when browsing (enc/freeze/loss/bs/...), not only in the .ckpt name.
-    if args.train_mode in ('jepa', 'jepa_decoder', 'jepa_gene_query'):
-        checkpoint_path = os.path.join(checkpoint_path, filename)
-        ckpt_filename = '{epoch:02d}'
-    else:
-        ckpt_filename = f'{filename}-' + '{epoch:02d}'
+    ckpt_filename = f'{filename}-' + '{epoch:02d}'
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpoint_path,
         filename=ckpt_filename,
@@ -939,13 +675,9 @@ def main(argv=None) -> None:
             stage=2,
         )
     elif args.parallel_distribution == 'ddp':
-        # scmaskgit-backed JEPA only uses the encode path; MaskGIT heads are unused.
-        find_unused = args.train_mode in ('jepa', 'jepa_decoder', 'jepa_gene_query')
-        # Force Lightning's own process group — mpi4py is installed on this host
-        # and PL would otherwise pick MPIEnvironment/OpenMPI, which hangs here
-        # (orted / "No network interfaces for out-of-band communications").
+        # Force Lightning's own process group — mpi4py/OpenMPI hangs on this host.
         parallel_comp_strategy = DDPStrategy(
-            find_unused_parameters=find_unused,
+            find_unused_parameters=False,
             cluster_environment=LightningEnvironment(),
             process_group_backend='nccl',
         )
@@ -1001,16 +733,11 @@ def main(argv=None) -> None:
                 )
         else:
             trainer.fit(pretrained_module, data_module)
-    elif args.train_mode in ('jepa', 'jepa_gene_query'):
-        # Token embeddings may be warm-started inside JEPATrainer from
-        # --ckpt_masking_path; do not PL-resume unless path is a JEPA ckpt.
-        trainer.fit(pretrained_module, data_module)
-    elif args.train_mode in ('count', 'jepa_decoder'):
+    elif args.train_mode == 'count':
         trainer.fit(decoder_module, data_module)
     else:
         raise ValueError(
-            'train_mode not recognised, needs to be '
-            'masking, count, jepa, jepa_decoder, or jepa_gene_query'
+            'train_mode not recognised, needs to be masking or count'
         )
 
 if __name__ == '__main__':

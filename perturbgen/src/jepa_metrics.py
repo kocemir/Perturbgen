@@ -1,59 +1,18 @@
-"""Metrics and analysis helpers for JEPA research phases B–F."""
+"""Gene-Query JEPA — VICReg variance/covariance (optional anti-collapse).
+
+Used by GeneQueryJEPATrainer when vicreg_var_coeff / vicreg_cov_coeff > 0.
+The hyperparameter sweep turns VICReg on/off; leave both coeffs at 0 to disable.
+
+Honesty metric is NOT here: it is val/gene_gap_vs_copy_src in the trainer.
+Index: docs/examples/GENE_QUERY_JEPA.md
+"""
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Tuple
 
-import numpy as np
 import torch
 import torch.nn.functional as F
-
-
-def latent_collapse_stats(
-    z: torch.Tensor,
-    max_samples: int = 4096,
-    seed: int = 42,
-) -> Dict[str, float]:
-    """Diagnostics for representation collapse.
-
-    Mean pairwise cosine uses at most ``max_samples`` rows to avoid O(n²) RAM
-    blow-ups on full-dataset embedding dumps.
-    """
-    z = z.detach().float()
-    if z.ndim != 2 or z.size(0) < 2:
-        return {
-            'std_mean': float(z.std().item()) if z.numel() else 0.0,
-            'mean_cosine': 0.0,
-            'norm_mean': float(z.norm(dim=-1).mean().item()) if z.numel() else 0.0,
-        }
-    z_norm = F.normalize(z, dim=-1)
-    n = z_norm.size(0)
-    if n > max_samples:
-        g = torch.Generator(device=z_norm.device)
-        g.manual_seed(seed)
-        idx = torch.randperm(n, generator=g, device=z_norm.device)[:max_samples]
-        z_norm = z_norm[idx]
-        n = z_norm.size(0)
-    sim = z_norm @ z_norm.T
-    mask = ~torch.eye(n, dtype=torch.bool, device=sim.device)
-    mean_cosine = sim[mask].mean().item()
-    return {
-        'std_mean': float(z.std(dim=0).mean().item()),
-        'mean_cosine': float(mean_cosine),
-        'norm_mean': float(z.norm(dim=-1).mean().item()),
-    }
-
-
-def pairwise_latent_mse(
-    z_hat: torch.Tensor, z_tgt: torch.Tensor
-) -> Dict[str, float]:
-    mse = F.mse_loss(z_hat, z_tgt).item()
-    cos = F.cosine_similarity(z_hat, z_tgt, dim=-1).mean().item()
-    return {
-        'mse': float(mse),
-        'cosine': float(cos),
-        'cosine_loss': float(1.0 - cos),
-    }
 
 
 def vicreg_var_cov(
@@ -69,7 +28,6 @@ def vicreg_var_cov(
     if z.ndim != 2 or z.size(0) < 2:
         zero = z.sum() * 0.0
         return zero, zero
-    # Center across batch (standard VICReg).
     z_c = z - z.mean(dim=0)
     std = torch.sqrt(z_c.var(dim=0, unbiased=False) + eps)
     var_loss = F.relu(gamma - std).mean()
@@ -78,156 +36,3 @@ def vicreg_var_cov(
     off_diag = cov.pow(2).sum() - cov.diagonal().pow(2).sum()
     cov_loss = off_diag / d
     return var_loss, cov_loss
-
-
-def subsample_embeddings(
-    features: np.ndarray,
-    labels: np.ndarray,
-    max_samples: int = 8000,
-    seed: int = 42,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Random subsample for sklearn metrics on large dumps."""
-    n = features.shape[0]
-    if n <= max_samples:
-        return features, labels
-    rng = np.random.default_rng(seed)
-    idx = rng.choice(n, size=max_samples, replace=False)
-    return features[idx], labels[idx]
-
-
-def linear_probe_accuracy(
-    features: np.ndarray,
-    labels: np.ndarray,
-    test_size: float = 0.2,
-    seed: int = 42,
-    max_samples: int = 8000,
-) -> float:
-    """Simple logistic-regression probe accuracy (sklearn if available)."""
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.model_selection import train_test_split
-    from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import StandardScaler
-
-    if len(np.unique(labels)) < 2:
-        return float('nan')
-    features, labels = subsample_embeddings(features, labels, max_samples, seed)
-    _, counts = np.unique(labels, return_counts=True)
-    stratify = labels if counts.min() >= 2 else None
-    x_train, x_test, y_train, y_test = train_test_split(
-        features,
-        labels,
-        test_size=test_size,
-        random_state=seed,
-        stratify=stratify,
-    )
-    clf = make_pipeline(
-        StandardScaler(),
-        LogisticRegression(max_iter=500, solver='saga', tol=1e-3, n_jobs=1),
-    )
-    clf.fit(x_train, y_train)
-    return float(clf.score(x_test, y_test))
-
-
-def silhouette_safe(
-    features: np.ndarray,
-    labels: np.ndarray,
-    max_samples: int = 1500,
-    seed: int = 42,
-) -> float:
-    """Silhouette on a small subsample (O(n²) pairwise distances)."""
-    from sklearn.metrics import silhouette_score
-
-    if len(np.unique(labels)) < 2 or features.shape[0] < 3:
-        return float('nan')
-    features, labels = subsample_embeddings(features, labels, max_samples, seed)
-    return float(silhouette_score(features, labels, metric='euclidean'))
-
-
-def neighbor_purity(
-    features: np.ndarray,
-    labels: np.ndarray,
-    k: int = 15,
-    max_samples: int = 8000,
-    seed: int = 42,
-) -> float:
-    """Fraction of kNN neighbors sharing the same label."""
-    from sklearn.neighbors import NearestNeighbors
-
-    if features.shape[0] <= k:
-        return float('nan')
-    features, labels = subsample_embeddings(features, labels, max_samples, seed)
-    if features.shape[0] <= k:
-        return float('nan')
-    nn = NearestNeighbors(n_neighbors=k + 1, metric='euclidean')
-    nn.fit(features)
-    indices = nn.kneighbors(features, return_distance=False)[:, 1:]
-    hits = 0
-    total = 0
-    for i, neigh in enumerate(indices):
-        hits += int((labels[neigh] == labels[i]).sum())
-        total += k
-    return float(hits / max(total, 1))
-
-
-def compare_representation_quality(
-    emb_a: np.ndarray,
-    emb_b: np.ndarray,
-    labels: Dict[str, np.ndarray],
-    name_a: str = 'jepa',
-    name_b: str = 'masking',
-) -> Dict[str, Dict[str, float]]:
-    """Phase B: compare two embedding sets on shared label probes."""
-    report: Dict[str, Dict[str, float]] = {}
-    for label_name, y in labels.items():
-        report[label_name] = {
-            f'{name_a}_probe_acc': linear_probe_accuracy(emb_a, y),
-            f'{name_b}_probe_acc': linear_probe_accuracy(emb_b, y),
-            f'{name_a}_silhouette': silhouette_safe(emb_a, y),
-            f'{name_b}_silhouette': silhouette_safe(emb_b, y),
-            f'{name_a}_nn_purity': neighbor_purity(emb_a, y),
-            f'{name_b}_nn_purity': neighbor_purity(emb_b, y),
-        }
-    return report
-
-
-def trajectory_baselines(
-    z_src: torch.Tensor,
-    z_tgt: torch.Tensor,
-    z_hat: torch.Tensor,
-) -> Dict[str, Dict[str, float]]:
-    """Phase C: JEPA predictor vs identity and mean baselines."""
-    identity = pairwise_latent_mse(z_src, z_tgt)
-    # constant predictor: batch mean of z_src
-    mean_pred = z_src.mean(dim=0, keepdim=True).expand_as(z_tgt)
-    mean_base = pairwise_latent_mse(mean_pred, z_tgt)
-    model = pairwise_latent_mse(z_hat, z_tgt)
-    return {
-        'identity': identity,
-        'mean_src': mean_base,
-        'jepa': model,
-    }
-
-
-def simulate_latent_perturbation(
-    z_src: torch.Tensor,
-    direction: torch.Tensor,
-    scale: float = 1.0,
-) -> torch.Tensor:
-    """Phase E: simple additive intervention in latent space."""
-    direction = F.normalize(direction.float(), dim=-1)
-    return z_src + scale * direction.unsqueeze(0).expand_as(z_src)
-
-
-def package_comparison_summary(
-    phase_b: Optional[Dict] = None,
-    phase_c: Optional[Dict] = None,
-    phase_d: Optional[Dict] = None,
-    phase_e: Optional[Dict] = None,
-) -> Dict:
-    """Phase F: gather replacement comparison package."""
-    return {
-        'representation': phase_b or {},
-        'trajectory': phase_c or {},
-        'generation': phase_d or {},
-        'applications': phase_e or {},
-    }

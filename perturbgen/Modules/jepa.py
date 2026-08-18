@@ -1,39 +1,31 @@
-"""Cell-trajectory JEPA backbone for PerturbGen replacement research.
+"""Gene-Query JEPA — lightweight CellEncoder (CPU tests / no pretrained ckpt).
 
-``CellEncoder`` stays free of scmaskgit imports. The pretrained MaskGIT source
-encoder lives in ``jepa_scmaskgit.py`` and is selected via
-``encoder_type='scmaskgit'``.
+THIS IS NOT THE TRAINING MODEL.
+The only JEPA we train is Gene-Query JEPA:
+  perturbgen/Modules/gene_query_jepa.py
+  docs/examples/train_gene_query_jepa.py       (--data toy|full)
+  docs/examples/run_gene_query_toy_sweep.sh    (hyperparameter search)
+
+This file exists so tests can run on CPU without loading the 768-d MaskGIT
+encoder. Production / toy / sweep always use encoder_type='scmaskgit'
+(jepa_scmaskgit.py).
+
+Honesty metric (everywhere): val/gene_gap_vs_copy_src must be > 0.
+Index: docs/examples/GENE_QUERY_JEPA.md
 """
 
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
 
 def generate_pad(input_ids: torch.Tensor) -> torch.Tensor:
     return input_ids == 0
-
-
-def modify_ckpt_state_dict(checkpoint, replace_str: str):
-    if 'module' in checkpoint.keys():
-        state_dict = checkpoint['module']
-    elif 'state_dict' in checkpoint.keys():
-        state_dict = checkpoint['state_dict']
-    else:
-        state_dict = checkpoint
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith(replace_str):
-            k = k.replace(replace_str, '', 1)
-        k = k.replace('_orig_mod.', '')
-        new_state_dict[k] = v
-    return new_state_dict
 
 
 def mean_pool_tokens(
@@ -64,7 +56,7 @@ def _sinusoidal(length: int, d_model: int) -> torch.Tensor:
 
 
 class TimePosSinEncoding(nn.Module):
-    """Minimal time + position sinusoidal encoding for JEPA cell sequences."""
+    """Sequence + dummy time sinusoidal encoding for the tiny CellEncoder."""
 
     def __init__(self, d_model: int, length: int, n_time_steps: int):
         super().__init__()
@@ -78,7 +70,11 @@ class TimePosSinEncoding(nn.Module):
 
 
 class CellEncoder(nn.Module):
-    """Encode a gene-token cell sequence to a single cell embedding."""
+    """Tiny transformer: gene-token sequence -> token embeddings + pooled cell.
+
+    Used only when GeneQueryJEPA(encoder_type='cell'), i.e. unit tests.
+    Toy training and hyperparameter search use SCMaskGITCellEncoder instead.
+    """
 
     def __init__(
         self,
@@ -94,7 +90,7 @@ class CellEncoder(nn.Module):
         pos_encoding_mode: str = 'time_pos_sin',
     ):
         super().__init__()
-        del pos_encoding_mode  # reserved for API compatibility with train.py
+        del pos_encoding_mode
         self.d_model = d_model
         self.pad_token = pad_token
         self.token_embedding = nn.Embedding(
@@ -136,263 +132,3 @@ class CellEncoder(nn.Module):
             'token_embedding': token_emb,
             'cell_embedding': cell_emb,
         }
-
-
-class TimeConditionedPredictor(nn.Module):
-    """Predict target cell embedding from context embedding + target time."""
-
-    def __init__(
-        self,
-        d_model: int,
-        n_time_steps: int,
-        hidden_multiplier: int = 4,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-        self.time_embedding = nn.Embedding(n_time_steps + 1, d_model)
-        hidden = d_model * hidden_multiplier
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model * 2, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, d_model),
-        )
-
-    def forward(self, z_context: torch.Tensor, time_step: int) -> torch.Tensor:
-        t = torch.full(
-            (z_context.size(0),),
-            int(time_step),
-            device=z_context.device,
-            dtype=torch.long,
-        )
-        t_emb = self.time_embedding(t)
-        return self.mlp(torch.cat([z_context, t_emb], dim=-1))
-
-
-class CellTrajectoryJEPA(nn.Module):
-    """JEPA: predict future cell latents from source cell latents.
-
-    Context encoder is trainable (unless frozen). Target encoder is an EMA copy
-    (stop-grad).
-
-    encoder_type:
-      - ``scmaskgit``: pretrained MaskGIT source encoder (default for LPS runs)
-      - ``cell``: lightweight ``CellEncoder`` (original JEPA scaffold)
-    """
-
-    def __init__(
-        self,
-        vocab_size: int,
-        d_model: int = 256,
-        num_heads: int = 8,
-        num_layers: int = 2,
-        d_ff: int = 1024,
-        max_seq_length: int = 2048,
-        n_total_tps: int = 3,
-        pred_tps: Optional[List[int]] = None,
-        dropout: float = 0.0,
-        ema_decay: float = 0.996,
-        pad_token: int = 0,
-        pos_encoding_mode: Literal[
-            'time_pos_sin', 'comb_sin', 'sin_learnt', 'time_pos_learnt'
-        ] = 'time_pos_sin',
-        normalize_latents: bool = True,
-        encoder_type: Literal['scmaskgit', 'cell'] = 'cell',
-        encoder_path: Optional[str] = None,
-        freeze_encoder: bool = False,
-        jepa_encoder_layers: int = 3,
-    ):
-        super().__init__()
-        self.pred_tps = pred_tps if pred_tps is not None else [1, 2, 3]
-        self.n_total_tps = n_total_tps
-        self.ema_decay = ema_decay
-        self.normalize_latents = normalize_latents
-        self.encoder_type = encoder_type
-        self.jepa_encoder_layers = jepa_encoder_layers
-
-        if encoder_type == 'scmaskgit':
-            from perturbgen.Modules.jepa_scmaskgit import SCMaskGITCellEncoder
-
-            self.context_encoder = SCMaskGITCellEncoder(
-                encoder_path=encoder_path,
-                freeze=freeze_encoder,
-                n_encoder_layers=jepa_encoder_layers,
-            )
-            self.target_encoder = self.context_encoder.clone_as_ema_target()
-            self.d_model = self.context_encoder.d_model
-        elif encoder_type == 'cell':
-            encoder_kwargs = dict(
-                vocab_size=vocab_size,
-                d_model=d_model,
-                num_heads=num_heads,
-                num_layers=num_layers,
-                d_ff=d_ff,
-                max_seq_length=max_seq_length,
-                n_time_steps=n_total_tps + 1,
-                dropout=dropout,
-                pad_token=pad_token,
-                pos_encoding_mode=pos_encoding_mode,
-            )
-            self.context_encoder = CellEncoder(**encoder_kwargs)
-            self.target_encoder = CellEncoder(**encoder_kwargs)
-            self.target_encoder.load_state_dict(self.context_encoder.state_dict())
-            for param in self.target_encoder.parameters():
-                param.requires_grad = False
-            if freeze_encoder:
-                for param in self.context_encoder.parameters():
-                    param.requires_grad = False
-            self.d_model = d_model
-        else:
-            raise ValueError(
-                f"encoder_type must be 'scmaskgit' or 'cell', got {encoder_type!r}"
-            )
-
-        self.predictor = TimeConditionedPredictor(
-            d_model=self.d_model,
-            n_time_steps=n_total_tps,
-            dropout=dropout,
-        )
-
-    @torch.no_grad()
-    def update_target_encoder(self) -> None:
-        for online, target in zip(
-            self.context_encoder.parameters(),
-            self.target_encoder.parameters(),
-        ):
-            target.data.mul_(self.ema_decay).add_(
-                online.data, alpha=1.0 - self.ema_decay
-            )
-
-    def _maybe_normalize(self, z: torch.Tensor) -> torch.Tensor:
-        if self.normalize_latents:
-            return F.normalize(z, dim=-1)
-        return z
-
-    def encode_context(
-        self, input_ids: torch.Tensor, time_step: int = 0
-    ) -> Dict[str, torch.Tensor]:
-        out = self.context_encoder(input_ids, time_step=time_step)
-        out['cell_embedding'] = self._maybe_normalize(out['cell_embedding'])
-        return out
-
-    @torch.no_grad()
-    def encode_target(
-        self, input_ids: torch.Tensor, time_step: int
-    ) -> Dict[str, torch.Tensor]:
-        was_training = self.target_encoder.training
-        self.target_encoder.eval()
-        out = self.target_encoder(input_ids, time_step=time_step)
-        out['cell_embedding'] = self._maybe_normalize(out['cell_embedding'])
-        if was_training:
-            self.target_encoder.train()
-        return out
-
-    def forward(
-        self,
-        src_input_ids: torch.Tensor,
-        tgt_input_id_dict: Dict[str, torch.Tensor],
-        pred_tps: Optional[List[int]] = None,
-    ) -> Dict[str, Dict[str, torch.Tensor]]:
-        """Predict each requested target time from the source cell embedding."""
-        times = pred_tps if pred_tps is not None else self.pred_tps
-        z_src = self.encode_context(src_input_ids, time_step=0)['cell_embedding']
-        outputs: Dict[str, Dict[str, torch.Tensor]] = {}
-        for t in times:
-            key = f'tgt_input_ids_t{t}'
-            if key not in tgt_input_id_dict:
-                continue
-            z_tgt = self.encode_target(tgt_input_id_dict[key], time_step=t)[
-                'cell_embedding'
-            ]
-            z_hat = self.predictor(z_src, time_step=t)
-            if self.normalize_latents:
-                z_hat = F.normalize(z_hat, dim=-1)
-            outputs[t] = {
-                'z_src': z_src,
-                'z_tgt': z_tgt,
-                'z_hat': z_hat,
-            }
-        return outputs
-
-    def load_token_embedding_from_masking_ckpt(self, ckpt_path: str) -> List[str]:
-        """Warm-start token embeddings (``cell`` encoder only).
-
-        For ``scmaskgit``, the full pretrained encoder is already loaded via
-        ``encoder_path``; this is a no-op.
-        """
-        if self.encoder_type != 'cell':
-            return []
-        if not hasattr(self.context_encoder, 'token_embedding'):
-            return []
-        checkpoint = torch.load(ckpt_path, map_location='cpu')
-        state = modify_ckpt_state_dict(checkpoint, 'transformer.')
-        # Prefer nested scmaskgit embedding if present (global vocab).
-        weight_key = None
-        for key in (
-            'encoder_layers.model.token_embedding.weight',
-            'token_embedding.weight',
-        ):
-            if key in state:
-                weight_key = key
-                break
-        loaded = []
-        if weight_key is not None:
-            src = state[weight_key]
-            dst = self.context_encoder.token_embedding.weight
-            n = min(src.shape[0], dst.shape[0])
-            d = min(src.shape[1], dst.shape[1])
-            with torch.no_grad():
-                dst[:n, :d].copy_(src[:n, :d])
-                self.target_encoder.token_embedding.weight[:n, :d].copy_(
-                    src[:n, :d]
-                )
-            loaded.append(weight_key)
-        return loaded
-
-
-class JEPACountDecoder(nn.Module):
-    """Phase D: map JEPA cell latents to gene expression (counts)."""
-
-    def __init__(
-        self,
-        jepa: CellTrajectoryJEPA,
-        n_genes: int,
-        d_model: int,
-        dropout: float = 0.0,
-        freeze_jepa: bool = True,
-    ):
-        super().__init__()
-        self.jepa = jepa
-        if freeze_jepa:
-            for param in self.jepa.parameters():
-                param.requires_grad = False
-        self.head = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 2, n_genes),
-        )
-        self.n_genes = n_genes
-
-    def forward(
-        self,
-        src_input_ids: torch.Tensor,
-        tgt_input_id_dict: Dict[str, torch.Tensor],
-        pred_tps: Optional[List[int]] = None,
-        use_predicted_latent: bool = True,
-    ) -> Dict[int, torch.Tensor]:
-        times = pred_tps if pred_tps is not None else self.jepa.pred_tps
-        with torch.set_grad_enabled(any(p.requires_grad for p in self.jepa.parameters())):
-            jepa_out = self.jepa(
-                src_input_ids=src_input_ids,
-                tgt_input_id_dict=tgt_input_id_dict,
-                pred_tps=times,
-            )
-        counts = {}
-        for t, out in jepa_out.items():
-            z = out['z_hat'] if use_predicted_latent else out['z_tgt']
-            counts[t] = F.relu(self.head(z))
-        return counts

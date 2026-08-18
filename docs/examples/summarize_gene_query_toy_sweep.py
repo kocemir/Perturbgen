@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Summarise the Gene-Query JEPA toy sweep into one ranked table + CSV.
+"""Gene-Query JEPA — rank the toy hyperparameter sweep (KEEP THIS FILE).
+
+Honesty metric: val/gene_gap_vs_copy_src must be > 0.
+Index: docs/examples/GENE_QUERY_JEPA.md
 
 Usage:
   python docs/examples/summarize_gene_query_toy_sweep.py
@@ -62,7 +65,10 @@ def load_epochs(metrics_csv: Path) -> List[Dict[str, float]]:
 
 
 def summarise_run(run_dir: Path) -> Optional[Dict[str, object]]:
-    metrics_files = sorted(run_dir.glob('toy_logs/**/metrics.csv'))
+    metrics_files = (
+        sorted(run_dir.glob('logs/**/metrics.csv'))
+        or sorted(run_dir.glob('toy_logs/**/metrics.csv'))
+    )
     if not metrics_files:
         return None
     epochs = load_epochs(metrics_files[-1])

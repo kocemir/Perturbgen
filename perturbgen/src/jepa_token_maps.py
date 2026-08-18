@@ -1,4 +1,12 @@
-"""Token-ID remaps for JEPA (global pretrain IDs vs remapped HVG / row IDs)."""
+"""Gene-Query JEPA — GLOBAL (pretrained ~19k) vs LOCAL (2k HVG) token-id maps.
+
+KEEP THIS FILE. Source sequences use GLOBAL ids (MaskGIT vocab). Target
+sequences use LOCAL ids. The trainer converts with these lookup tables
+before tensors enter an encoder.
+
+Honesty metric: val/gene_gap_vs_copy_src > 0.
+Index: docs/examples/GENE_QUERY_JEPA.md
+"""
 
 from __future__ import annotations
 
