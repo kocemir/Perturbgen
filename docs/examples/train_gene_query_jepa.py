@@ -12,6 +12,9 @@ USAGE
   # full: every LPS cell (paper-style, no hold-out)
   python docs/examples/train_gene_query_jepa.py --data full --split false
 
+  # dump embeddings from a checkpoint (1 GPU). Writes embeddings/*.h5ad
+  python docs/examples/train_gene_query_jepa.py --eval-ckpt path/to/epoch=02.ckpt
+
   python docs/examples/train_gene_query_jepa.py --help
 """
 
@@ -171,6 +174,38 @@ def build_parser() -> argparse.ArgumentParser:
     ckpt.add_argument('--ckpt-top-k', type=int, default=-1, help='-1 keeps all')
     ckpt.add_argument('--ckpt-save-last', type=_bool, default=True)
     ckpt.add_argument('--ckpt-weights-only', type=_bool, default=False)
+
+    ev = parser.add_argument_group('eval dump (notebook 08)')
+    ev.add_argument(
+        '--eval-ckpt',
+        default=None,
+        help='if set, skip training and dump cell/gene embeddings from this ckpt',
+    )
+    ev.add_argument(
+        '--eval-split',
+        choices=('test', 'all'),
+        default='all',
+        help='all = every cell; test = frozen 10%% pickle',
+    )
+    ev.add_argument(
+        '--eval-split-path',
+        default=(
+            f'{TOKENIZED}/splits/'
+            'stratified_cell_type_harmonized_seed42_80_10_10.pkl'
+        ),
+        help='pickle used when --eval-split test',
+    )
+    ev.add_argument(
+        '--eval-force',
+        type=_bool,
+        default=False,
+        help='re-run dump even if jepa_cell_embeddings.h5ad already exists',
+    )
+    ev.add_argument(
+        '--gene-name-id-dict',
+        default='/mnt/sod2-project/csb4/stuke1/Geneformer/geneformer/gene_name_id_dict.pkl',
+        help='optional Ensembl↔symbol map written into the gene h5ad',
+    )
     return parser
 
 
@@ -417,6 +452,213 @@ def print_metrics_table(metrics_csv_path: str, has_val: bool) -> float:
     return last_gap
 
 
+TIME_LABEL = {1: '90m_LPS', 2: '6h_LPS', 3: '10h_LPS'}
+EVAL_VAR_LIST = ['cell_pairing_index', 'time_after_LPS', 'cell_type_harmonized']
+
+
+def _ensembl_to_symbol(path: Optional[str]) -> Dict[str, str]:
+    if not path or not Path(path).is_file():
+        return {}
+    with open(path, 'rb') as handle:
+        raw = pickle.load(handle)
+    out: Dict[str, str] = {}
+    for key, value in raw.items():
+        key_s, val_s = str(key), str(value)
+        if key_s.startswith('ENSG'):
+            out[key_s] = val_s
+        elif val_s.startswith('ENSG'):
+            out[val_s] = key_s
+    return out
+
+
+def write_jepa_h5ads(
+    run_dir: Path,
+    mapping_path: str,
+    gene_name_id_dict: Optional[str] = None,
+) -> Tuple[Path, Path]:
+    import anndata as ad
+    import numpy as np
+    import pandas as pd
+    import torch
+
+    pt_path = run_dir / 'embeddings' / 'gene_query_jepa_embeddings.pt'
+    if not pt_path.is_file():
+        raise SystemExit(f'missing dump: {pt_path}')
+    payload = torch.load(pt_path, map_location='cpu', weights_only=False)
+    out_dir = run_dir / 'embeddings'
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    z_hat = np.asarray(payload['z_hat_cell'])
+    z_src = np.asarray(payload['z_src_cell'])
+    z_tgt = np.asarray(payload['z_tgt_cell'])
+    time_step = np.asarray(payload['time']).reshape(-1).astype(int)
+    n_cells = int(z_hat.shape[0])
+    obs = pd.DataFrame(
+        {
+            'time_step': time_step,
+            'time_after_LPS': [TIME_LABEL.get(int(t), str(t)) for t in time_step],
+        },
+        index=[f'row_{i}' for i in range(n_cells)],
+    )
+    for col in EVAL_VAR_LIST:
+        values = payload.get(col)
+        if values is None:
+            continue
+        if len(values) != n_cells:
+            print(f'warning: skip obs {col}: len {len(values)} != {n_cells}')
+            continue
+        obs[col] = list(values)
+        if col == 'time_after_LPS':
+            obs['time_after_LPS'] = [str(v) for v in values]
+
+    cell = ad.AnnData(X=z_hat.copy(), obs=obs)
+    cell.obsm['z_hat_cell'] = z_hat
+    cell.obsm['z_src_cell'] = z_src
+    cell.obsm['z_tgt_cell'] = z_tgt
+    cell_path = out_dir / 'jepa_cell_embeddings.h5ad'
+    cell.write_h5ad(cell_path)
+
+    with open(mapping_path, 'rb') as handle:
+        id_to_ensembl = pickle.load(handle)
+    gene_mean: Dict[str, Any] = payload['gene_mean']
+    gene_count: Dict[str, Any] = payload['gene_count']
+    vocab = int(next(iter(gene_mean.values())).shape[0])
+    hat_counts = np.zeros(vocab, dtype=np.float64)
+    for key, counts in gene_count.items():
+        if str(key).startswith('hat_'):
+            hat_counts += np.asarray(counts).reshape(-1)
+    keep = hat_counts > 0
+    token_ids = np.where(keep)[0]
+    ensembl = [
+        str(id_to_ensembl.get(int(i), f'local_{int(i)}')) for i in token_ids
+    ]
+    symbol_map = _ensembl_to_symbol(gene_name_id_dict)
+    symbols = [symbol_map.get(e, e) for e in ensembl]
+    var = pd.DataFrame(
+        {
+            'token_id': token_ids,
+            'ensembl_id': ensembl,
+            'gene_symbol': symbols,
+            'n_queries_hat': hat_counts[token_ids],
+        },
+        index=ensembl,
+    )
+    gene = ad.AnnData(X=np.zeros((1, len(token_ids)), dtype=np.float32), var=var)
+    for key, mat in gene_mean.items():
+        arr = np.asarray(mat)[token_ids]
+        gene.varm[str(key)] = arr
+        if str(key).startswith('hat_t'):
+            step = int(str(key).split('t')[-1])
+            gene.varm[TIME_LABEL[step]] = arr
+            gene.varm[f'hat_{TIME_LABEL[step]}'] = arr
+        elif str(key).startswith('tgt_t'):
+            step = int(str(key).split('t')[-1])
+            gene.varm[f'tgt_{TIME_LABEL[step]}'] = arr
+        elif str(key).startswith('src_t'):
+            step = int(str(key).split('t')[-1])
+            gene.varm[f'src_{TIME_LABEL[step]}'] = arr
+    for key, counts in gene_count.items():
+        gene.var[f'count_{key}'] = np.asarray(counts)[token_ids]
+    gene_path = out_dir / 'jepa_gene_embeddings.h5ad'
+    gene.write_h5ad(gene_path)
+    print(f'Wrote {cell_path}  ({cell.n_obs} cell-time rows)')
+    print(f'Wrote {gene_path}  ({gene.n_vars} genes)')
+    return cell_path, gene_path
+
+
+def run_eval(args: argparse.Namespace) -> None:
+    ckpt = Path(args.eval_ckpt)
+    if not ckpt.is_file():
+        raise SystemExit(f'--eval-ckpt not found: {ckpt}')
+    run_dir = ckpt.parent.parent
+    if args.output_dir:
+        run_dir = Path(args.output_dir)
+    cell_h5ad = run_dir / 'embeddings' / 'jepa_cell_embeddings.h5ad'
+    if cell_h5ad.is_file() and not args.eval_force:
+        print(f'{cell_h5ad} already exists; skip dump (pass --eval-force true to redo)')
+        return
+
+    import pytorch_lightning as pl
+    from datasets import load_from_disk
+
+    from perturbgen.Dataloaders.datamodule import PerturbGenDataModule
+    from perturbgen.Model.gene_query_jepa_trainer import GeneQueryJEPATrainer
+    from perturbgen.src.utils import read_dataset_files
+
+    gpu_ids = args.gpu[:1]
+    if len(args.gpu) > 1:
+        print(f'eval dump is not DDP-safe; using GPU {gpu_ids[0]} only')
+    pl.seed_everything(args.seed, workers=True)
+
+    src_dataset = load_from_disk(f'{args.tokenized}/dataset_2000_hvg_src/normal.dataset')
+    tgt_datasets = read_dataset_files(f'{args.tokenized}/dataset_2000_hvg_tgt', 'dataset')
+    n_cells = len(src_dataset)
+    if args.eval_split == 'test':
+        _, _, test_i = load_split_pickle(args.eval_split_path)
+        print(f'eval split=test: {len(test_i)} cells from {args.eval_split_path}')
+        print(
+            'NOTE: this JEPA run trained with --split false (all cells). '
+            'The frozen test split is for a tractable UMAP, not a clean hold-out.'
+        )
+        use_split = True
+    else:
+        test_i = list(range(n_cells))
+        print(f'eval split=all: {len(test_i)} cells')
+        use_split = False
+
+    data_module = PerturbGenDataModule(
+        src_dataset=src_dataset,
+        tgt_datasets=tgt_datasets,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        shuffle=False,
+        split=use_split,
+        pred_tps=[1, 2, 3],
+        n_total_tps=3,
+        context_tps=[1, 2, 3],
+        train_indices=test_i,
+        val_indices=None,
+        test_indices=test_i,
+        var_list=EVAL_VAR_LIST,
+        use_weighted_sampler=False,
+        seed=args.seed,
+    )
+
+    model = GeneQueryJEPATrainer.load_from_checkpoint(
+        str(ckpt),
+        map_location='cpu',
+        output_dir=str(run_dir),
+        var_list=EVAL_VAR_LIST,
+    )
+    model.output_dir = str(run_dir)
+    model.var_list = EVAL_VAR_LIST
+    (run_dir / 'embeddings').mkdir(parents=True, exist_ok=True)
+    info = run_dir / 'embeddings' / 'ckpt_info.txt'
+    info_lines = [
+        f'ckpt={ckpt}',
+        f'eval_split={args.eval_split}',
+        f'n_eval_cells={len(test_i)}',
+    ]
+    if args.eval_split == 'test':
+        info_lines.append(f'eval_split_path={args.eval_split_path}')
+    info.write_text('\n'.join(info_lines) + '\n')
+    print(f'Wrote {info}')
+
+    trainer = pl.Trainer(
+        accelerator='gpu',
+        devices=gpu_ids,
+        logger=False,
+        enable_checkpointing=False,
+        num_sanity_val_steps=0,
+    )
+    trainer.test(model, datamodule=data_module)
+    write_jepa_h5ads(
+        run_dir,
+        f'{args.tokenized}/token_id_to_genename_2000_hvg.pkl',
+        args.gene_name_id_dict,
+    )
+
+
 def print_verdict(args: argparse.Namespace, last_gap: float, metrics_path: str) -> None:
     print('\n================ VERDICT ================')
     print(f'data={args.data}  final {GAP} = {last_gap:+.4f}')
@@ -430,7 +672,11 @@ def print_verdict(args: argparse.Namespace, last_gap: float, metrics_path: str) 
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
-    args = apply_mode_defaults(build_parser().parse_args(argv))
+    args = build_parser().parse_args(argv)
+    if args.eval_ckpt:
+        run_eval(args)
+        return
+    args = apply_mode_defaults(args)
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     run_dir = resolve_run_dir(args, stamp)
     run_name = run_dir.name

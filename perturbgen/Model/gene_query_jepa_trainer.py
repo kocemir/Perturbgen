@@ -414,8 +414,7 @@ class GeneQueryJEPATrainer(LightningModule):
         print(
             f'GeneQueryJEPA: encoder={jepa_encoder}, d_model={self.model.d_model}, '
             f'n_queries={n_queries}, query_mode={query_mode}, '
-            f'(shared {frac_shared:.0%} / '
-            f'tgt-only {frac_tgt_only:.0%} / absent rest in mixed mode), '
+            f'(shared {frac_shared:.0%} / tgt-only {frac_tgt_only:.0%}, no absent), '
             f'predictor_layers={predictor_layers}, '
             f'lambda_gene={lambda_gene}, lambda_cell={lambda_cell}, '
             f'lambda_contr={self.lambda_contrastive}, '
@@ -431,6 +430,11 @@ class GeneQueryJEPATrainer(LightningModule):
         self._test_gene_sums: Dict[str, torch.Tensor] = {}
         self._test_gene_counts: Dict[str, torch.Tensor] = {}
         self._test_cell_rows: Dict[str, list] = {}
+
+    def on_test_epoch_start(self) -> None:
+        self._test_gene_sums = {}
+        self._test_gene_counts = {}
+        self._test_cell_rows = {}
 
     def setup(self, stage: Optional[str] = None) -> None:
         # Give each DDP rank its own sampling stream so GPUs don't all ask
@@ -599,6 +603,7 @@ class GeneQueryJEPATrainer(LightningModule):
             '_gene_ids_local': gene_ids_local,
             '_is_present': is_present,
             '_is_valid': is_valid,
+            '_src_position': src_position,
         }
 
     # ------------------------------------------------------------------
@@ -685,12 +690,13 @@ class GeneQueryJEPATrainer(LightningModule):
             gene_ids = result['_gene_ids_local']          # (B, Q) LOCAL ids
             is_present = result['_is_present']            # (B, Q)
             is_valid = result['_is_valid']                # (B, Q)
+            src_position = result['_src_position']        # (B, Q)
             valid_present = is_present & is_valid
 
             # ---- accumulate per-gene running sums (present queries only) --
             for name, embeddings in (
-                ('hat', out['z_hat_gene']),                # predicted
-                ('tgt', out['z_tgt_gene']),                # true (EMA)
+                ('hat', out['z_hat_gene']),
+                ('tgt', out['z_tgt_gene']),
             ):
                 key = f'{name}_t{time_step}'
                 if key not in self._test_gene_sums:
@@ -698,8 +704,29 @@ class GeneQueryJEPATrainer(LightningModule):
                         vocab_size, self.model.d_model
                     )
                     self._test_gene_counts[key] = torch.zeros(vocab_size)
-                flat_ids = gene_ids[valid_present].cpu()            # (n,)
-                flat_embeddings = embeddings[valid_present].cpu()   # (n, D)
+                flat_ids = gene_ids[valid_present].cpu()
+                flat_embeddings = embeddings[valid_present].cpu()
+                self._test_gene_sums[key].index_add_(
+                    0, flat_ids, flat_embeddings.float()
+                )
+                self._test_gene_counts[key].index_add_(
+                    0, flat_ids, torch.ones(flat_ids.numel())
+                )
+
+            in_both = valid_present & (src_position >= 0)
+            if bool(in_both.any()):
+                key = f'src_t{time_step}'
+                if key not in self._test_gene_sums:
+                    self._test_gene_sums[key] = torch.zeros(
+                        vocab_size, self.model.d_model
+                    )
+                    self._test_gene_counts[key] = torch.zeros(vocab_size)
+                dim = out['h_src'].size(-1)
+                safe_pos = src_position.clamp(min=0)
+                index = safe_pos.unsqueeze(-1).expand(-1, -1, dim)
+                z_src_gene = torch.gather(out['h_src'], dim=1, index=index)
+                flat_ids = gene_ids[in_both].cpu()
+                flat_embeddings = z_src_gene[in_both].cpu()
                 self._test_gene_sums[key].index_add_(
                     0, flat_ids, flat_embeddings.float()
                 )

@@ -23,7 +23,21 @@ bash docs/examples/run_gene_query_toy_sweep.sh
 python docs/examples/summarize_gene_query_toy_sweep.py
 ```
 
-Full-run curves: [08_GeneQuery_JEPA_Full_Curves.ipynb](08_GeneQuery_JEPA_Full_Curves.ipynb).
+Embedding analysis (cell UMAP + gene programs, like notebooks 04/05):
+[08_GeneQuery_JEPA_Embedding_Analysis.ipynb](08_GeneQuery_JEPA_Embedding_Analysis.ipynb).
+
+Dump from a checkpoint (1 GPU):
+
+```bash
+python docs/examples/train_gene_query_jepa.py \
+    --eval-ckpt path/to/checkpoints/epoch=02.ckpt \
+    --eval-split all --gpu 7
+```
+
+`--eval-split all` dumps every LPS cell (default). `--eval-split test` is the
+frozen 10% pickle only.
+
+Full-run curves: [09_GeneQuery_JEPA_Full_Curves.ipynb](09_GeneQuery_JEPA_Full_Curves.ipynb).
 
 `--data toy` uses `--batches-per-type × --batch-size` cells from every
 `cell_type_harmonized` class, and trains/validates on those same cells.
@@ -45,7 +59,8 @@ pytest perturbgen/tests/test_gene_query_jepa.py -v
 | `docs/examples/train_gene_query_jepa.py` | Unified train (toy or full) |
 | `docs/examples/run_gene_query_toy_sweep.sh` | 144-run toy HPO |
 | `docs/examples/summarize_gene_query_toy_sweep.py` | Rank sweep runs |
-| `docs/examples/08_GeneQuery_JEPA_Full_Curves.ipynb` | Full-run training curves |
+| `docs/examples/08_GeneQuery_JEPA_Embedding_Analysis.ipynb` | Cell/gene analysis of a JEPA ckpt |
+| `docs/examples/09_GeneQuery_JEPA_Full_Curves.ipynb` | Full-run training curves |
 | `perturbgen/Modules/gene_query_jepa.py` | Model |
 | `perturbgen/Model/gene_query_jepa_trainer.py` | Lightning trainer |
 | `perturbgen/Modules/jepa_scmaskgit.py` | Pretrained MaskGIT encoder |
