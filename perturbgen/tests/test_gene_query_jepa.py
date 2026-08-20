@@ -22,7 +22,7 @@ from perturbgen.Model.gene_query_jepa_trainer import (
     sample_query_batch,
 )
 from perturbgen.src.jepa_token_maps import build_lookup_tables
-from perturbgen.Modules.gene_query_jepa import DCTQueryBuilder
+from perturbgen.Modules.gene_query_jepa import GeneQueryPredictor
 
 
 # --------------------------------------------------------------------------
@@ -60,59 +60,22 @@ def test_info_nce_skipped_when_too_few_present():
     assert float(loss) == 0.0
 
 
-def test_dct_query_builder_shared_shift_vs_induced_gain():
-    """Shared adds a DCT shift to H_src; induced scales e(g). Same t, different type."""
+def test_predictor_time_changes_output():
+    """Different time_step must produce different predictions."""
     torch.manual_seed(0)
-    builder = DCTQueryBuilder(d_model=8, n_basis=2)
-    h_src = torch.randn(1, 3, 8)
-    identity = torch.randn(1, 3, 8)
-    is_shared = torch.tensor([[True, False, True]])
-    q1 = builder(h_src, identity, is_shared, time_step=1)
-    q2 = builder(h_src, identity, is_shared, time_step=2)
-    assert q1.shape == (1, 3, 8)
-    # Time must change the query.
+    d = 8
+    predictor = GeneQueryPredictor(d_model=d, n_time_steps=3, num_layers=1, num_heads=2)
+    gene_embs = torch.randn(1, 3, d)
+    source = torch.randn(1, 5, d)
+    pad = torch.zeros(1, 5, dtype=torch.bool)
+    q1 = predictor(gene_embs, time_step=1, source_memory=source, source_is_padding=pad)
+    q2 = predictor(gene_embs, time_step=2, source_memory=source, source_is_padding=pad)
+    assert q1.shape == (1, 3, d)
     assert (q1 - q2).abs().sum().item() > 0
-    # Induced slot is a scaled identity, not H_src + shift.
-    induced = q1[0, 1]
-    ident = identity[0, 1]
-    # Gain is sigmoid → same sign as e(g), strictly smaller magnitude.
-    assert torch.all(induced * ident >= -1e-5)
-    assert torch.all(induced.abs() <= ident.abs() + 1e-5)
-
-
-def test_sampler_pads_when_present_pool_is_small():
-    """Q larger than present genes -> invalid pads, not absent decoys."""
-    _, global_to_local, _ = make_id_maps()
-    src = torch.tensor([[100, 101, 102, 105, 0, 0]])
-    tgt = torch.tensor([[4, 5, 10, 11, 0, 0]])
-    all_gene_local_ids = list(
-        range(FIRST_REAL_GENE_LOCAL_ID, FIRST_REAL_GENE_LOCAL_ID + N_GENES)
-    )
-    quiz = sample_query_batch(
-        src_input_ids_global=src,
-        tgt_input_ids_local=tgt,
-        global_to_local=global_to_local,
-        all_gene_local_ids=all_gene_local_ids,
-        n_queries=8,
-        frac_shared=0.5,
-        frac_tgt_only=0.5,
-        query_mode='mixed',
-        shared_max_queries=0,
-        rng=random.Random(0),
-    )
-    is_present = quiz['is_present'][0]
-    is_valid = quiz['is_valid'][0]
-    assert int(is_present.sum()) == 4
-    assert int(is_valid.sum()) == 4
-    assert not bool((~is_valid & is_present).any())
-    tgt_genes = {4, 5, 10, 11}
-    for gene, valid in zip(quiz['gene_ids_local'][0].tolist(), is_valid.tolist()):
-        if valid:
-            assert gene in tgt_genes
 
 
 def test_sampler_mix_and_positions():
-    """One cell with a known gene layout: check pools, counts, positions."""
+    """One cell: ~50% shared / ~30% tgt-only / rest absent decoys."""
     _, global_to_local, _ = make_id_maps()
 
     # Source cell expresses genes (GLOBAL): 100, 101, 102, 105  -> LOCAL 4,5,6,9
@@ -129,9 +92,9 @@ def test_sampler_mix_and_positions():
         tgt_input_ids_local=tgt,
         global_to_local=global_to_local,
         all_gene_local_ids=all_gene_local_ids,
-        n_queries=4,
-        frac_shared=0.5,      # wants 2 shared, exactly 2 exist
-        frac_tgt_only=0.5,    # wants 2 target-only, exactly 2 exist
+        n_queries=8,
+        frac_shared=0.5,      # wants 4 shared; only 2 exist
+        frac_tgt_only=0.3,    # wants 2 target-only; 2 exist
         query_mode='mixed',
         shared_max_queries=0,
         rng=random.Random(0),
@@ -142,24 +105,28 @@ def test_sampler_mix_and_positions():
     tgt_position = quiz['tgt_position'][0].tolist()
     src_position = quiz['src_position'][0].tolist()
 
-    # 4 present questions (2 shared + 2 target-only). No absent decoys.
+    # Present pool has 4 genes, so 4 present + 4 absent decoys.
+    assert len(gene_ids) == 8
     assert sum(is_present) == 4
-    assert len(gene_ids) == 4
-    assert all(quiz['is_valid'][0].tolist())
+    assert sum(1 for p in is_present if not p) == 4
+    assert 'is_valid' not in quiz
 
     tgt_genes = {4, 5, 10, 11}
     for gene, present, pos_t, pos_s in zip(
         gene_ids, is_present, tgt_position, src_position
     ):
-        assert present
-        assert gene in tgt_genes
-        # The recorded target position must really hold that gene.
-        assert tgt[0, pos_t].item() == gene
-        if gene in (4, 5):          # shared genes: source position valid
-            assert pos_s >= 0
-            local_of_src_token = global_to_local[src[0, pos_s]].item()
-            assert local_of_src_token == gene
-        else:                        # target-only genes: not in source
+        if present:
+            assert gene in tgt_genes
+            assert tgt[0, pos_t].item() == gene
+            if gene in (4, 5):
+                assert pos_s >= 0
+                local_of_src_token = global_to_local[src[0, pos_s]].item()
+                assert local_of_src_token == gene
+            else:
+                assert pos_s == -1
+        else:
+            assert gene not in tgt_genes
+            assert pos_t == 0
             assert pos_s == -1
 
 
@@ -241,7 +208,7 @@ def test_backward_reaches_predictor_and_context(tiny_trainer):
         )
 
     assert has_gradient(tiny_trainer.model.predictor)
-    assert has_gradient(tiny_trainer.model.predictor.query_time)
+    assert has_gradient(tiny_trainer.model.predictor.time_embedding)
     assert has_gradient(tiny_trainer.model.population_context)
     assert has_gradient(tiny_trainer.model.online_encoder)
     # The EMA target encoder must never receive gradients.

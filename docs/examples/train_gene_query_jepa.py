@@ -224,6 +224,7 @@ def apply_mode_defaults(args: argparse.Namespace) -> argparse.Namespace:
 def spec_run_name(args: argparse.Namespace, stamp: str) -> str:
     """Filesystem-safe folder name with the knobs that distinguish runs."""
     freeze = 'fzT' if args.freeze_encoder else 'fzF'
+    split_tag = 'splitT' if args.data == 'full' and args.split else 'splitF'
     contr = (
         f'contr{args.lambda_contrastive:g}'
         if args.lambda_contrastive > 0
@@ -233,7 +234,6 @@ def spec_run_name(args: argparse.Namespace, stamp: str) -> str:
         vic = f'vic{args.vicreg_var:g}_{args.vicreg_cov:g}'
     else:
         vic = 'vic0'
-    split_tag = 'splitT' if args.data == 'full' and args.split else 'splitF'
     name = (
         f'{freeze}'
         f'_encL{args.encoder_layers}'
@@ -316,9 +316,9 @@ def build_specs(
             'query_mode': args.query_mode,
             'shared_max_queries': args.shared_max_queries,
             'frac_shared': 0.5,
-            'frac_tgt_only': 0.5,
-            'absent_queries': False,
-            'query_time': 'dct_k2_shared_shift_induced_gain',
+            'frac_tgt_only': 0.3,
+            'absent_queries': True,
+            'query_time': 'learned_embedding',
             'lambda_gene': args.lambda_gene,
             'lambda_cell': args.lambda_cell,
             'lambda_contrastive': args.lambda_contrastive,
@@ -737,7 +737,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         predictor_layers=args.predictor_layers,
         n_queries=args.n_queries,
         frac_shared=0.5,
-        frac_tgt_only=0.5,
+        frac_tgt_only=0.3,
         query_mode=args.query_mode,
         shared_max_queries=args.shared_max_queries,
         lambda_gene=args.lambda_gene,

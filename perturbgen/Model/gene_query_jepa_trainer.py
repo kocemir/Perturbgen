@@ -10,11 +10,12 @@ WHAT HAPPENS EVERY TRAINING STEP (plain language)
 1. The dataloader hands us a batch: source cells (normal / resting tokens)
    and their pseudo-paired target cells at each later timepoint (t1, t2, t3).
 2. For every cell and timepoint we SAMPLE GENE QUERIES — a quiz sheet of
-   ``n_queries`` genes per cell, present at the target time only:
+   ``n_queries`` genes per cell (three parts):
       ~50%  genes present in BOTH source and target   (shared — shift)
-      ~50%  genes present ONLY in the target           (induced — birth)
-      leftover slots filled from the other present pool. No absent decoys.
+      ~30%  genes present ONLY in the target           (induced)
+      ~20%  genes absent from the target               (decoys; answer is "absent")
 3. The model predicts each queried gene's embedding at the target time.
+   Timepoints are independent (no autoregressive context).
 4. Losses:  gene loss   = 1 - cosine(predicted, true)   ... main signal
             cell loss   = 1 - cosine(pooled prediction, pooled target)
             contrastive = InfoNCE on present queries (anti-collapse)
@@ -82,63 +83,37 @@ def sample_query_batch(
     n_queries: int,
     frac_shared: float,
     frac_tgt_only: float,
-    query_mode: str,
-    shared_max_queries: int,
     rng: random.Random,
+    query_mode: str = 'mixed',
+    shared_max_queries: int = 0,
 ) -> Dict[str, torch.Tensor]:
     """Build the per-cell quiz sheet. Returns CPU tensors, all shaped (B, Q).
 
-    Returned keys:
-      gene_ids_local  which gene each query asks about (LOCAL id)
-      is_present      True if that gene really occurs in the target cell
-      tgt_position    where the gene sits in tgt_input_ids (0 for absent
-                      queries — the model ignores it for those)
-      src_position    where the gene sits in src_input_ids, or -1 if the
-                      source cell does not express it (used only for the
-                      copy-source baseline metric)
-      is_valid        True for real queries, False for padded placeholders
-
-    Worked example for one cell with n_queries=4:
-      target genes  = {A, B, C, D, E}     source genes = {A, B, X, Y}
-      shared        = {A, B}         -> want 2, have 2
-      target-only   = {C, D, E}      -> want 2, have 3 -> ask 2
-      no absent decoys; leftover Q would be filled from leftover present genes
+    Three pools: shared (~50%), target-only (~30%), absent decoys (the rest).
+    query_mode / shared_max_queries are accepted for old CLI flags and ignored.
     """
+    del query_mode, shared_max_queries
     batch_size = tgt_input_ids_local.size(0)
-    if query_mode not in {'mixed', 'all_shared'}:
-        raise ValueError(
-            f'unknown query_mode={query_mode!r}; expected "mixed" or "all_shared"'
-        )
 
-    # Work on plain Python lists (fast enough, much easier to follow).
     src_rows = src_input_ids_global.detach().cpu().tolist()
     tgt_rows = tgt_input_ids_local.detach().cpu().tolist()
     global_to_local_list = global_to_local.detach().cpu().tolist()
 
+    all_genes_set = set(all_gene_local_ids)
     n_shared_wanted = round(frac_shared * n_queries)
     n_tgt_only_wanted = round(frac_tgt_only * n_queries)
 
-    # One list per output key; we append one row (length Q) per cell.
     out_gene_ids: List[List[int]] = []
     out_is_present: List[List[bool]] = []
     out_tgt_position: List[List[int]] = []
     out_src_position: List[List[int]] = []
-    out_is_valid: List[List[bool]] = []
-
-    per_cell_shared: List[List[int]] = []
-    per_cell_tgt_pos: List[Dict[int, int]] = []
-    per_cell_src_pos: List[Dict[int, int]] = []
 
     for cell in range(batch_size):
-        # -- Which genes does the TARGET cell express, and where? ----------
         tgt_gene_position: Dict[int, int] = {}
         for position, token in enumerate(tgt_rows[cell]):
             if token >= FIRST_REAL_GENE_LOCAL_ID and token not in tgt_gene_position:
                 tgt_gene_position[token] = position
 
-        # -- Which genes does the SOURCE cell express, and where? ----------
-        # Source tokens are GLOBAL ids; translate each one to LOCAL. Genes
-        # outside our 2000-HVG vocabulary translate to 0 and are skipped.
         src_gene_position: Dict[int, int] = {}
         for position, token in enumerate(src_rows[cell]):
             if 0 <= token < len(global_to_local_list):
@@ -148,113 +123,61 @@ def sample_query_batch(
             if local_id >= FIRST_REAL_GENE_LOCAL_ID and local_id not in src_gene_position:
                 src_gene_position[local_id] = position
 
-        # -- Split the target's genes into the two present pools. ----------
         shared_pool = [g for g in tgt_gene_position if g in src_gene_position]
         tgt_only_pool = [g for g in tgt_gene_position if g not in src_gene_position]
-        per_cell_shared.append(shared_pool)
-        per_cell_tgt_pos.append(tgt_gene_position)
-        per_cell_src_pos.append(src_gene_position)
 
-        if query_mode == 'all_shared':
-            continue
-
-        # -- Decide how many questions to take from each pool. -------------
         take_shared = min(len(shared_pool), n_shared_wanted)
         take_tgt_only = min(len(tgt_only_pool), n_tgt_only_wanted)
-        # Fill leftover Q from present pools only (no absent decoys).
-        missing = n_queries - (take_shared + take_tgt_only)
-        if missing > 0:
-            extra = min(missing, len(tgt_only_pool) - take_tgt_only)
-            take_tgt_only += extra
-            missing -= extra
+        present_quota = n_shared_wanted + n_tgt_only_wanted
+        missing = present_quota - (take_shared + take_tgt_only)
         if missing > 0:
             extra = min(missing, len(shared_pool) - take_shared)
             take_shared += extra
+            missing -= extra
+        if missing > 0:
+            extra = min(missing, len(tgt_only_pool) - take_tgt_only)
+            take_tgt_only += extra
+        n_absent = n_queries - take_shared - take_tgt_only
 
-        chosen_shared = (
-            rng.sample(shared_pool, take_shared) if take_shared else []
-        )
+        chosen_shared = rng.sample(shared_pool, take_shared) if take_shared else []
         chosen_tgt_only = (
             rng.sample(tgt_only_pool, take_tgt_only) if take_tgt_only else []
         )
+        absent_pool = list(all_genes_set - set(tgt_gene_position))
+        chosen_absent = rng.sample(
+            absent_pool, min(n_absent, len(absent_pool))
+        ) if n_absent and absent_pool else []
 
-        # -- Write this cell's row of the quiz sheet. -----------------------
         row_gene_ids: List[int] = []
         row_is_present: List[bool] = []
         row_tgt_position: List[int] = []
         row_src_position: List[int] = []
-        row_is_valid: List[bool] = []
         for gene in chosen_shared + chosen_tgt_only:
             row_gene_ids.append(gene)
             row_is_present.append(True)
             row_tgt_position.append(tgt_gene_position[gene])
             row_src_position.append(src_gene_position.get(gene, -1))
-            row_is_valid.append(True)
-        # Pad only if this cell has fewer present genes than Q.
+        for gene in chosen_absent:
+            row_gene_ids.append(gene)
+            row_is_present.append(False)
+            row_tgt_position.append(0)
+            row_src_position.append(-1)
         while len(row_gene_ids) < n_queries:
             row_gene_ids.append(all_gene_local_ids[0])
             row_is_present.append(False)
             row_tgt_position.append(0)
             row_src_position.append(-1)
-            row_is_valid.append(False)
 
         out_gene_ids.append(row_gene_ids)
         out_is_present.append(row_is_present)
         out_tgt_position.append(row_tgt_position)
         out_src_position.append(row_src_position)
-        out_is_valid.append(row_is_valid)
-
-    if query_mode == 'all_shared':
-        max_shared = max((len(shared) for shared in per_cell_shared), default=0)
-        if shared_max_queries > 0:
-            max_shared = min(max_shared, shared_max_queries)
-        # Keep tensor shapes legal even if a batch has no shared genes.
-        max_shared = max(1, max_shared)
-
-        for cell in range(batch_size):
-            shared_pool = per_cell_shared[cell]
-            tgt_gene_position = per_cell_tgt_pos[cell]
-            src_gene_position = per_cell_src_pos[cell]
-
-            if len(shared_pool) > max_shared:
-                # Safety cap for memory-heavy settings; deterministic sampling
-                # comes from the trainer seed.
-                chosen_shared = rng.sample(shared_pool, max_shared)
-            else:
-                chosen_shared = shared_pool
-
-            row_gene_ids: List[int] = []
-            row_is_present: List[bool] = []
-            row_tgt_position: List[int] = []
-            row_src_position: List[int] = []
-            row_is_valid: List[bool] = []
-
-            for gene in chosen_shared:
-                row_gene_ids.append(gene)
-                row_is_present.append(True)
-                row_tgt_position.append(tgt_gene_position[gene])
-                row_src_position.append(src_gene_position[gene])
-                row_is_valid.append(True)
-
-            while len(row_gene_ids) < max_shared:
-                row_gene_ids.append(all_gene_local_ids[0])
-                row_is_present.append(False)
-                row_tgt_position.append(0)
-                row_src_position.append(-1)
-                row_is_valid.append(False)
-
-            out_gene_ids.append(row_gene_ids)
-            out_is_present.append(row_is_present)
-            out_tgt_position.append(row_tgt_position)
-            out_src_position.append(row_src_position)
-            out_is_valid.append(row_is_valid)
 
     return {
         'gene_ids_local': torch.tensor(out_gene_ids, dtype=torch.long),
         'is_present': torch.tensor(out_is_present, dtype=torch.bool),
         'tgt_position': torch.tensor(out_tgt_position, dtype=torch.long),
         'src_position': torch.tensor(out_src_position, dtype=torch.long),
-        'is_valid': torch.tensor(out_is_valid, dtype=torch.bool),
     }
 
 
@@ -292,10 +215,8 @@ def info_nce_present_genes(
     positives = z_tgt[is_present]     # (N, D)
     n = anchors.size(0)
     if n < 2:
-        # Need at least one negative; otherwise contrastive is undefined.
         return z_hat.new_zeros(())
 
-    # Cosine similarities (embeddings are usually already L2-normalised).
     anchors = F.normalize(anchors, dim=-1)
     positives = F.normalize(positives, dim=-1)
     logits = (anchors @ positives.T) / temperature          # (N, N)
@@ -316,17 +237,15 @@ class GeneQueryJEPATrainer(LightningModule):
         # ---- query sampling ----
         n_queries: int = 64,
         frac_shared: float = 0.5,
-        frac_tgt_only: float = 0.5,
+        frac_tgt_only: float = 0.3,
         query_mode: str = 'mixed',
         shared_max_queries: int = 0,
         predictor_layers: int = 2,
         # ---- loss weights (gene-primary, cell-auxiliary) ----
         lambda_gene: float = 1.0,
         lambda_cell: float = 0.1,
-        # Contrastive anti-collapse (InfoNCE on present queries). 0 disables.
-        lambda_contrastive: float = 0.3,
+        lambda_contrastive: float = 0.0,
         contrastive_temperature: float = 0.1,
-        # VICReg is optional; 0 disables both terms.
         vicreg_var_coeff: float = 0.0,
         vicreg_cov_coeff: float = 0.0,
         vicreg_gamma: Optional[float] = None,
@@ -413,8 +332,8 @@ class GeneQueryJEPATrainer(LightningModule):
         )
         print(
             f'GeneQueryJEPA: encoder={jepa_encoder}, d_model={self.model.d_model}, '
-            f'n_queries={n_queries}, query_mode={query_mode}, '
-            f'(shared {frac_shared:.0%} / tgt-only {frac_tgt_only:.0%}, no absent), '
+            f'n_queries={n_queries} (shared {frac_shared:.0%} / '
+            f'tgt-only {frac_tgt_only:.0%} / absent rest), '
             f'predictor_layers={predictor_layers}, '
             f'lambda_gene={lambda_gene}, lambda_cell={lambda_cell}, '
             f'lambda_contr={self.lambda_contrastive}, '
@@ -477,8 +396,6 @@ class GeneQueryJEPATrainer(LightningModule):
             n_queries=self.n_queries,
             frac_shared=self.frac_shared,
             frac_tgt_only=self.frac_tgt_only,
-            query_mode=self.query_mode,
-            shared_max_queries=self.shared_max_queries,
             rng=self.rng,
         )
         device = src_ids_global.device
@@ -486,7 +403,6 @@ class GeneQueryJEPATrainer(LightningModule):
         is_present = quiz['is_present'].to(device)                  # (B, Q)
         tgt_position = quiz['tgt_position'].to(device)              # (B, Q)
         src_position = quiz['src_position'].to(device)              # (B, Q)
-        is_valid = quiz['is_valid'].to(device)                      # (B, Q)
 
         # 2) Convert every id tensor into the encoder's id space.
         out = self.model.forward_one_timestep(
@@ -495,41 +411,36 @@ class GeneQueryJEPATrainer(LightningModule):
             query_gene_ids=self._local_ids_to_encoder_space(gene_ids_local),
             query_is_present=is_present,
             query_tgt_position=tgt_position,
-            query_src_position=src_position,
             time_step=time_step,
         )
 
         # 3) Losses. -------------------------------------------------------
-        # Gene loss: valid queries only (present genes vs EMA target row).
+        # Gene loss: every query counts — present vs EMA, absent vs null vec.
         per_query_distance = cosine_distance(
             out['z_hat_gene'], out['z_tgt_gene']
         )                                                           # (B, Q)
-        gene_loss = masked_mean(per_query_distance, is_valid)
+        gene_loss = per_query_distance.mean()
 
         # Cell loss: pooled prediction vs pooled target.
         cell_loss = cosine_distance(
             out['z_hat_cell'], out['z_tgt_cell']
         ).mean()
 
-        # Contrastive anti-collapse: present queries must match their own
-        # target gene and stay away from other genes in the batch.
         if self.lambda_contrastive > 0.0:
             contrastive_loss = info_nce_present_genes(
                 z_hat=out['z_hat_gene'],
                 z_tgt=out['z_tgt_gene'],
-                is_present=(is_present & is_valid),
+                is_present=is_present,
                 temperature=self.contrastive_temperature,
             )
         else:
             contrastive_loss = gene_loss.new_zeros(())
 
-        # VICReg is optional; skip the compute when both coefficients are 0.
         embedding_dim = out['z_hat_gene'].size(-1)
         if self.vicreg_var_coeff > 0.0 or self.vicreg_cov_coeff > 0.0:
             if self.vicreg_gamma is not None:
                 gamma = self.vicreg_gamma
             elif self.hparams.normalize_latents:
-                # On the unit sphere a typical coordinate has size ~1/sqrt(D).
                 gamma = 1.0 / (embedding_dim ** 0.5)
             else:
                 gamma = 1.0
@@ -555,26 +466,22 @@ class GeneQueryJEPATrainer(LightningModule):
         # 4) Honesty metrics (no gradients needed). --------------------------
         with torch.no_grad():
             per_query_cosine = 1.0 - per_query_distance             # (B, Q)
-            valid_present = is_present & is_valid
-            gene_cos_pred = masked_mean(per_query_cosine, valid_present)
+            gene_cos_pred = masked_mean(per_query_cosine, is_present)
 
-            # Static baseline: gene identity vector vs true embedding.
             static_cosine = F.cosine_similarity(
                 out['z_static_gene'], out['z_tgt_gene'], dim=-1
-            )                                                       # (B, Q)
-            gene_cos_static = masked_mean(static_cosine, valid_present)
+            )
+            gene_cos_static = masked_mean(static_cosine, is_present)
 
-            # Copy-source baseline, only where the gene exists in BOTH cells:
-            # grab the gene's embedding out of the source cell and compare.
-            in_both = valid_present & (src_position >= 0)           # (B, Q)
-            safe_position = src_position.clamp(min=0)               # (B, Q)
+            in_both = is_present & (src_position >= 0)
+            safe_position = src_position.clamp(min=0)
             index = safe_position.unsqueeze(-1).expand(
                 -1, -1, embedding_dim
-            )                                                       # (B, Q, D)
+            )
             z_src_gene = torch.gather(out['h_src'], dim=1, index=index)
             copy_cosine = F.cosine_similarity(
                 z_src_gene, out['z_tgt_gene'], dim=-1
-            )                                                       # (B, Q)
+            )
             gene_cos_copy_src = masked_mean(copy_cosine, in_both)
             gene_cos_pred_shared = masked_mean(per_query_cosine, in_both)
 
@@ -592,17 +499,14 @@ class GeneQueryJEPATrainer(LightningModule):
             'contrastive_loss': contrastive_loss,
             'vicreg_var': vicreg_var,
             'vicreg_cov': vicreg_cov,
-            # prediction quality vs the two "no learning" baselines
             'gene_cos_pred': gene_cos_pred,
             'gene_gap_vs_static': gene_cos_pred - gene_cos_static,
             'gene_gap_vs_copy_src': gene_cos_pred_shared - gene_cos_copy_src,
             'cell_cos_pred': cell_cos_pred,
             'cell_gap_vs_copy_src': cell_cos_pred - cell_cos_copy_src,
-            # raw pieces, used by test_step to dump embeddings
             '_out': out,
             '_gene_ids_local': gene_ids_local,
             '_is_present': is_present,
-            '_is_valid': is_valid,
             '_src_position': src_position,
         }
 
@@ -689,9 +593,7 @@ class GeneQueryJEPATrainer(LightningModule):
             out = result['_out']
             gene_ids = result['_gene_ids_local']          # (B, Q) LOCAL ids
             is_present = result['_is_present']            # (B, Q)
-            is_valid = result['_is_valid']                # (B, Q)
             src_position = result['_src_position']        # (B, Q)
-            valid_present = is_present & is_valid
 
             # ---- accumulate per-gene running sums (present queries only) --
             for name, embeddings in (
@@ -704,8 +606,8 @@ class GeneQueryJEPATrainer(LightningModule):
                         vocab_size, self.model.d_model
                     )
                     self._test_gene_counts[key] = torch.zeros(vocab_size)
-                flat_ids = gene_ids[valid_present].cpu()
-                flat_embeddings = embeddings[valid_present].cpu()
+                flat_ids = gene_ids[is_present].cpu()
+                flat_embeddings = embeddings[is_present].cpu()
                 self._test_gene_sums[key].index_add_(
                     0, flat_ids, flat_embeddings.float()
                 )
@@ -713,7 +615,7 @@ class GeneQueryJEPATrainer(LightningModule):
                     0, flat_ids, torch.ones(flat_ids.numel())
                 )
 
-            in_both = valid_present & (src_position >= 0)
+            in_both = is_present & (src_position >= 0)
             if bool(in_both.any()):
                 key = f'src_t{time_step}'
                 if key not in self._test_gene_sums:
