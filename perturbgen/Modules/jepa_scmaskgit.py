@@ -20,6 +20,8 @@ import torch.nn as nn
 from scmaskgit.Modules.T_model import scmoscf
 from scmaskgit.src.utils import generate_pad, mean_nonpadding_embs
 
+from perturbgen.Modules.jepa import CLS_TOKEN_ID, cls_pool_tokens
+
 
 def _load_scmoscf_from_ckpt(encoder_path: str) -> scmoscf:
     """Build scmoscf and load weights (same layout as scmaskgitwrapper)."""
@@ -54,8 +56,9 @@ class SCMaskGITCellEncoder(nn.Module):
     """Encode gene-token IDs with the pretrained MaskGIT / scmaskgit backbone.
 
     Loads the full 12-layer pretrained body, then runs only the first
-    ``n_encoder_layers`` transformer blocks (early exit) and mean-pools.
-    Heads / width stay as in the ckpt (8 / 768). Freeze is optional.
+    ``n_encoder_layers`` transformer blocks (early exit). Cell vector is
+    either the non-pad mean (``cell_pool='mean'``) or the ``<cls>`` token
+    (``cell_pool='cls'``). Heads / width stay as in the ckpt (8 / 768).
     """
 
     def __init__(
@@ -63,8 +66,14 @@ class SCMaskGITCellEncoder(nn.Module):
         encoder_path: str,
         freeze: bool = False,
         n_encoder_layers: int = 3,
+        cell_pool: str = 'mean',
+        cls_token_id: int = CLS_TOKEN_ID,
     ):
         super().__init__()
+        if cell_pool not in ('mean', 'cls'):
+            raise ValueError(f'cell_pool must be mean or cls, got {cell_pool!r}')
+        self.cell_pool = cell_pool
+        self.cls_token_id = int(cls_token_id)
         if not encoder_path:
             raise ValueError('encoder_path is required for scmaskgit JEPA encoder')
         self.model = _load_scmoscf_from_ckpt(encoder_path)
@@ -96,11 +105,17 @@ class SCMaskGITCellEncoder(nn.Module):
         x = self.model.pos_embedding(x, 1)
         for block in self.model.decoder_block[: self.n_encoder_layers]:
             x, _ = block(x=x, tgt_mask=src_attention_mask)
+        if self.cell_pool == 'cls':
+            cell_embedding = cls_pool_tokens(
+                x, input_ids, cls_token_id=self.cls_token_id
+            )
+        else:
+            cell_embedding = mean_nonpadding_embs(
+                embs=x, pad=src_attention_mask
+            )
         return {
             'token_embedding': x,
-            'cell_embedding': mean_nonpadding_embs(
-                embs=x, pad=src_attention_mask
-            ),
+            'cell_embedding': cell_embedding,
         }
 
     def clone_as_ema_target(self) -> 'SCMaskGITCellEncoder':

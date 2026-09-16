@@ -178,6 +178,7 @@ class PerturbGenDataModule(LightningDataModule):
         context_tps: list | None = None,
         sampling_keys: list | None = None,
         use_weighted_sampler: bool = True,
+        strip_tgt_special_tokens: bool = True,
     ):
         """
         Description:
@@ -205,6 +206,7 @@ class PerturbGenDataModule(LightningDataModule):
         self.pad_token_id = self.gene_token_dict.get('<pad>')
         self.cls_token_id = self.gene_token_dict.get('<cls>')
         self.eos_token_id = self.gene_token_dict.get('<eos>')
+        self.strip_tgt_special_tokens = bool(strip_tgt_special_tokens)
         self.max_len = max_len
         self.dataset = None
         self.condition_keys = condition_keys
@@ -388,14 +390,17 @@ class PerturbGenDataModule(LightningDataModule):
                 out[f'tgt_size_factor_t{time_step}'] = torch.cat(tgt_size_factor, dim=0)
             # create input ids
             dataset = f'tgt_dataset_t{time_step}'
-            # remove all CLS tokens based on self.cls_token_id (don't assume it's the first token)
+            # JEPA keeps <cls>/<eos> when strip_tgt_special_tokens is False.
             tgt_input_ids_list = []
             length = []
             for d in batch:
                 seq = torch.as_tensor(d[dataset]['input_ids'])
-                filtered = seq[(seq != self.cls_token_id) & (seq != self.eos_token_id)]
-                tgt_input_ids_list.append(filtered)
-                length.append(int(filtered.size(0)))
+                if self.strip_tgt_special_tokens:
+                    seq = seq[
+                        (seq != self.cls_token_id) & (seq != self.eos_token_id)
+                    ]
+                tgt_input_ids_list.append(seq)
+                length.append(int(seq.size(0)))
             out[f'tgt_input_ids_t{time_step}'] = tgt_input_ids_list
             
             out[f'tgt_length_t{time_step}'] = torch.tensor(length)

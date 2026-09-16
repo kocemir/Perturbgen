@@ -269,6 +269,7 @@ class GeneQueryJEPATrainer(LightningModule):
         num_layers: int = 2,
         d_ff: int = 1024,
         max_seq_length: int = 2048,
+        cell_pool: str = 'mean',
         # Extra CLI keys shared with other train modes; accepted and ignored.
         **unused_cli_kwargs,
     ):
@@ -329,9 +330,11 @@ class GeneQueryJEPATrainer(LightningModule):
             num_layers=num_layers,
             d_ff=d_ff,
             max_seq_length=max_seq_length,
+            cell_pool=cell_pool,
         )
         print(
             f'GeneQueryJEPA: encoder={jepa_encoder}, d_model={self.model.d_model}, '
+            f'cell_pool={cell_pool}, '
             f'n_queries={n_queries} (shared {frac_shared:.0%} / '
             f'tgt-only {frac_tgt_only:.0%} / absent rest), '
             f'predictor_layers={predictor_layers}, '

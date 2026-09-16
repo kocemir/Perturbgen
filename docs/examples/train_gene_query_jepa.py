@@ -138,6 +138,19 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument('--ema-decay', type=float, default=0.996)
     model.add_argument('--lr', type=float, default=1e-4)
     model.add_argument('--weight-decay', type=float, default=1e-4)
+    model.add_argument(
+        '--cell-pool',
+        choices=('mean', 'cls'),
+        default='mean',
+        help='cell vector: mean of non-pad tokens, or the <cls> token embedding',
+    )
+    data.add_argument(
+        '--strip-tgt-special-tokens',
+        type=_bool,
+        default=False,
+        help='JEPA default False: keep <cls>/<eos> on target sequences. '
+        'PerturbGen train.py still strips. cell-pool=cls requires False.',
+    )
 
     train = parser.add_argument_group('train')
     train.add_argument('--epochs', type=int, default=None, help='default: toy 40, full 5')
@@ -218,6 +231,8 @@ def apply_mode_defaults(args: argparse.Namespace) -> argparse.Namespace:
         raise SystemExit('--batches-per-type must be >= 1 for --data toy')
     if args.data == 'full' and args.split and not args.split_path:
         raise SystemExit('--split true requires --split-path')
+    if args.cell_pool == 'cls' and args.strip_tgt_special_tokens:
+        raise SystemExit('--cell-pool cls requires --strip-tgt-special-tokens false')
     return args
 
 
@@ -248,6 +263,7 @@ def spec_run_name(args: argparse.Namespace, stamp: str) -> str:
         f'_lr{args.lr:g}'
         f'_seed{args.seed}'
         f'_{split_tag}'
+        f'_pool{args.cell_pool}'
     )
     if args.data == 'toy':
         name += f'_bpt{args.batches_per_type}'
@@ -306,9 +322,11 @@ def build_specs(
             'class_key': args.class_key,
             'split': bool(args.split) if args.data == 'full' else True,
             'pred_tps': [1, 2, 3],
+            'strip_tgt_special_tokens': args.strip_tgt_special_tokens,
         },
         'model': {
             'jepa_encoder': 'scmaskgit',
+            'cell_pool': args.cell_pool,
             'freeze_encoder': args.freeze_encoder,
             'encoder_layers': args.encoder_layers,
             'predictor_layers': args.predictor_layers,
@@ -622,6 +640,7 @@ def run_eval(args: argparse.Namespace) -> None:
         var_list=EVAL_VAR_LIST,
         use_weighted_sampler=False,
         seed=args.seed,
+        strip_tgt_special_tokens=args.strip_tgt_special_tokens,
     )
 
     model = GeneQueryJEPATrainer.load_from_checkpoint(
@@ -727,6 +746,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         test_indices=test_i,
         use_weighted_sampler=False,
         seed=args.seed,
+        strip_tgt_special_tokens=args.strip_tgt_special_tokens,
     )
 
     model = GeneQueryJEPATrainer(
@@ -755,10 +775,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         tokenid_to_rowid_path=f'{args.tokenized}/tokenid_to_rowid_2000_hvg.pkl',
         output_dir=args.output_dir,
         seed=args.seed,
+        cell_pool=args.cell_pool,
     )
     print(
         'Run config: '
         f'data={args.data}, freeze_encoder={args.freeze_encoder}, '
+        f'cell_pool={args.cell_pool}, '
+        f'strip_tgt_special_tokens={args.strip_tgt_special_tokens}, '
         f'predictor_layers={args.predictor_layers}, '
         f'encoder_layers={args.encoder_layers}, '
         f'batch_size={args.batch_size}, '

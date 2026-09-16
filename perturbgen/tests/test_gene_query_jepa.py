@@ -196,7 +196,7 @@ def test_forward_shapes_and_losses(tiny_trainer):
     assert out['z_hat_gene'].requires_grad
 
 
-def test_backward_reaches_predictor_and_context(tiny_trainer):
+def test_backward_reaches_predictor(tiny_trainer):
     batch = make_fake_batch()
     result = tiny_trainer._run_one_timestep(batch, time_step=1)
     result['total_loss'].backward()
@@ -209,7 +209,7 @@ def test_backward_reaches_predictor_and_context(tiny_trainer):
 
     assert has_gradient(tiny_trainer.model.predictor)
     assert has_gradient(tiny_trainer.model.predictor.time_embedding)
-    assert has_gradient(tiny_trainer.model.population_context)
+    assert not hasattr(tiny_trainer.model, 'population_context')
     assert has_gradient(tiny_trainer.model.online_encoder)
     # The EMA target encoder must never receive gradients.
     assert all(
@@ -230,3 +230,52 @@ def test_ema_update_moves_target_towards_online(tiny_trainer):
 
     # decay=0.996 -> the target should move by about 0.004 towards online.
     assert moved == pytest.approx(0.004, rel=0.05)
+
+
+def test_cls_pool_takes_cls_position():
+    from perturbgen.Modules.jepa import cls_pool_tokens
+
+    embs = torch.arange(24, dtype=torch.float).view(2, 4, 3)
+    ids = torch.tensor([[2, 10, 11, 0], [7, 2, 8, 0]])
+    pooled = cls_pool_tokens(embs, ids, cls_token_id=2)
+    assert torch.equal(pooled[0], embs[0, 0])
+    assert torch.equal(pooled[1], embs[1, 1])
+
+
+def test_cls_pool_errors_without_cls():
+    from perturbgen.Modules.jepa import cls_pool_tokens
+
+    embs = torch.zeros(1, 3, 4)
+    ids = torch.tensor([[4, 5, 0]])
+    with pytest.raises(ValueError, match='cell_pool=cls'):
+        cls_pool_tokens(embs, ids)
+
+
+def test_cell_pool_cls_forward(tmp_path):
+    tokenid_to_rowid, _, _ = make_id_maps()
+    tokenid_to_rowid[2] = 2  # <cls> is 2 in both GLOBAL and LOCAL
+    map_path = tmp_path / 'tokenid_to_rowid_test.pkl'
+    with open(map_path, 'wb') as f:
+        pickle.dump(tokenid_to_rowid, f)
+    trainer = GeneQueryJEPATrainer(
+        jepa_encoder='cell',
+        n_queries=8,
+        pred_tps=[1],
+        n_total_tps=3,
+        tokenid_to_rowid_path=str(map_path),
+        output_dir=str(tmp_path / 'out'),
+        tgt_vocab_size=60,
+        d_model=32,
+        num_heads=4,
+        num_layers=1,
+        d_ff=64,
+        max_seq_length=64,
+        seed=0,
+        cell_pool='cls',
+    )
+    batch = make_fake_batch()
+    batch['src_input_ids'][:, 0] = 2
+    batch['tgt_input_ids_t1'][:, 0] = 2
+    result = trainer._run_one_timestep(batch, time_step=1)
+    assert torch.isfinite(result['total_loss'])
+    assert trainer.model.online_encoder.cell_pool == 'cls'

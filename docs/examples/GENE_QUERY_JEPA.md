@@ -43,6 +43,9 @@ Full-run curves: [09_GeneQuery_JEPA_Full_Curves.ipynb](09_GeneQuery_JEPA_Full_Cu
 `cell_type_harmonized` class, and trains/validates on those same cells.
 `--data full` ignores `--batches-per-type`. `--split true` needs `--split-path`.
 
+JEPA keeps `<cls>` / `<eos>` on target sequences (`--strip-tgt-special-tokens false`).
+Cell vector: `--cell-pool mean` (non-pad average) or `--cell-pool cls` (the `<cls>` token).
+
 Full runs write everything under
 `.../T_perturb/res/jepa_gene_query_full_atlas/<spec-name>_{timestamp}/`
 (`specs.json`, `checkpoints/`, `logs/`).

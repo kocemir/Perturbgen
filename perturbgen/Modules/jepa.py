@@ -24,8 +24,30 @@ import torch.nn as nn
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
 
+CLS_TOKEN_ID = 2  # <cls> in both GLOBAL and LOCAL LPS vocabs
+
+
 def generate_pad(input_ids: torch.Tensor) -> torch.Tensor:
     return input_ids == 0
+
+
+def cls_pool_tokens(
+    embs: torch.Tensor,
+    input_ids: torch.Tensor,
+    cls_token_id: int = CLS_TOKEN_ID,
+) -> torch.Tensor:
+    """Take the embedding at the first <cls> token in each sequence."""
+    is_cls = input_ids == cls_token_id
+    has_cls = is_cls.any(dim=1)
+    if not bool(has_cls.all()):
+        n_missing = int((~has_cls).sum())
+        raise ValueError(
+            f'cell_pool=cls needs token id {cls_token_id} in every sequence; '
+            f'missing in {n_missing} row(s). Keep CLS (JEPA strip_tgt_special_tokens=False).'
+        )
+    index = is_cls.int().argmax(dim=1)
+    batch = torch.arange(embs.size(0), device=embs.device)
+    return embs[batch, index]
 
 
 def mean_pool_tokens(
@@ -88,11 +110,17 @@ class CellEncoder(nn.Module):
         dropout: float = 0.0,
         pad_token: int = 0,
         pos_encoding_mode: str = 'time_pos_sin',
+        cell_pool: str = 'mean',
+        cls_token_id: int = CLS_TOKEN_ID,
     ):
         super().__init__()
         del pos_encoding_mode
+        if cell_pool not in ('mean', 'cls'):
+            raise ValueError(f'cell_pool must be mean or cls, got {cell_pool!r}')
         self.d_model = d_model
         self.pad_token = pad_token
+        self.cell_pool = cell_pool
+        self.cls_token_id = cls_token_id
         self.token_embedding = nn.Embedding(
             vocab_size, d_model, padding_idx=pad_token
         )
@@ -127,7 +155,12 @@ class CellEncoder(nn.Module):
         x = self.token_embedding(input_ids) * math.sqrt(self.d_model)
         x = self.pos_embedding(x, tgt_time_step=time_step)
         token_emb = self.transformer(x, src_key_padding_mask=pad_mask)
-        cell_emb = mean_pool_tokens(token_emb, input_ids)
+        if self.cell_pool == 'cls':
+            cell_emb = cls_pool_tokens(
+                token_emb, input_ids, cls_token_id=self.cls_token_id
+            )
+        else:
+            cell_emb = mean_pool_tokens(token_emb, input_ids)
         return {
             'token_embedding': token_emb,
             'cell_embedding': cell_emb,

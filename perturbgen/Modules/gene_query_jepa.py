@@ -35,11 +35,9 @@ THE PICTURE
    gene embeddings H_src                            EMA encoder
    (batch, src_len, 768)                                    |
              |                                              v
-   [H_src ; population context] --> linear      gene embeddings H_tgt
-             |         (768*2 -> 768)           (batch, tgt_len, 768) stop-grad
-             v                                              |
+             v                                  gene embeddings H_tgt
         PREDICTOR  <-- query = e(g) + time_embed(t)         |
-   (transformer decoder, cross-attention to source)         |
+   (cross-attention to H_src)                   (batch, tgt_len, 768) stop-grad
              |                                              |
              v                                              v
    predicted gene embeddings  ---- gene loss ---->  true gene embeddings
@@ -52,9 +50,9 @@ THE PICTURE
 Design rules we committed to:
   1. TIME lives ONLY in the predictor. The encoders never see the timepoint,
      so their embeddings describe "what the cell/gene is", not "when it is".
-  2. CONTEXT: each cell's source embedding is enriched with the average
-     embedding of the OTHER cells in the batch (leave-one-out), because a
-     single cell alone cannot identify where the population is heading.
+  2. No batch population context. Predictor memory is H_src as the encoder
+     produced it (pasting the same cell vector onto every gene is a no-op
+     for attention and only wasted compute).
   3. The EMA (exponential moving average) target encoder provides the
      prediction targets and receives no gradients — standard JEPA recipe
      to avoid the trivial "everything maps to the same point" solution.
@@ -80,58 +78,11 @@ import torch.nn.functional as F
 PAD_TOKEN_ID = 0
 
 
-
-class PopulationContext(nn.Module):
-    """Mix each cell's embedding with the average of the OTHER cells.
-
-    Idea: one cell alone cannot tell us where the tissue is heading, but the
-    surrounding population can. All source cells in a batch come from the
-    same source timepoint, so the batch average is a cheap stand-in for
-    "the state of the population right now".
-
-    "Leave-one-out" means: for cell i we average everyone EXCEPT cell i,
-    so the cell cannot simply read information about itself from the context.
-    """
-
-    def __init__(self, d_model: int):
-        super().__init__()
-        # Takes [own gene embedding ; population context] and squeezes it
-        # back down to the normal embedding width.
-        self.mix = nn.Linear(d_model * 2, d_model)
-
-    def leave_one_out_mean(self, cell_embeddings: torch.Tensor) -> torch.Tensor:
-        """Average of the other cells' embeddings, one row per cell.
-
-        cell_embeddings: (B, D)   returns: (B, D)
-        """
-        batch_size = cell_embeddings.size(0)
-        if batch_size == 1:
-            # Only one cell: there is no "other cell", fall back to itself.
-            return cell_embeddings
-        total = cell_embeddings.sum(dim=0, keepdim=True)     # (1, D)
-        others_sum = total - cell_embeddings                 # (B, D)
-        return others_sum / (batch_size - 1)                 # (B, D)
-
-    def forward(
-        self,
-        token_embeddings: torch.Tensor,   # (B, Ls, D) per-gene embeddings
-        cell_embeddings: torch.Tensor,    # (B, D)     pooled per-cell embeddings
-    ) -> torch.Tensor:
-        context = self.leave_one_out_mean(cell_embeddings)   # (B, D)
-
-        # Give every gene position of cell i the same context vector.
-        context_per_token = context.unsqueeze(1)             # (B, 1, D)
-        context_per_token = context_per_token.expand_as(token_embeddings)
-
-        combined = torch.cat([token_embeddings, context_per_token], dim=-1)
-        return self.mix(combined)                            # (B, Ls, D)
-
-
 class GeneQueryPredictor(nn.Module):
     """Answer gene questions about the future.
 
     Each query = gene identity embedding + learned time embedding.
-    Queries cross-attend to the source cell's context-enriched embeddings
+    Queries cross-attend to the source cell's gene embeddings
     and see each other through self-attention.
     """
 
@@ -163,7 +114,7 @@ class GeneQueryPredictor(nn.Module):
         self,
         query_gene_embeddings: torch.Tensor,  # (B, Q, D)  gene identity e(g)
         time_step: int,                       # scalar: 1, 2, or 3
-        source_memory: torch.Tensor,          # (B, Ls, D) context-enriched source
+        source_memory: torch.Tensor,          # (B, Ls, D) source gene embeddings
         source_is_padding: torch.Tensor,      # (B, Ls)    True where src is pad
     ) -> torch.Tensor:
         time_index = torch.tensor(
@@ -209,11 +160,14 @@ class GeneQueryJEPA(nn.Module):
         num_layers: int = 2,
         d_ff: int = 1024,
         max_seq_length: int = 2048,
+        cell_pool: str = 'mean',
+        cls_token_id: int = 2,
     ):
         super().__init__()
         self.ema_decay = ema_decay
         self.normalize_latents = normalize_latents
         self.encoder_type = encoder_type
+        self.cell_pool = cell_pool
 
         # ------------------------------------------------------------------
         # 1) The two encoders: online (trains) and EMA target (frozen copy).
@@ -225,6 +179,8 @@ class GeneQueryJEPA(nn.Module):
                 encoder_path=encoder_path,
                 freeze=freeze_encoder,
                 n_encoder_layers=n_encoder_layers,
+                cell_pool=cell_pool,
+                cls_token_id=cls_token_id,
             )
             self.target_encoder = self.online_encoder.clone_as_ema_target()
             self.d_model = self.online_encoder.d_model
@@ -241,6 +197,8 @@ class GeneQueryJEPA(nn.Module):
                     max_seq_length=max_seq_length,
                     n_time_steps=n_time_steps + 1,
                     dropout=dropout,
+                    cell_pool=cell_pool,
+                    cls_token_id=cls_token_id,
                 )
 
             self.online_encoder = build_encoder()
@@ -256,12 +214,7 @@ class GeneQueryJEPA(nn.Module):
             raise ValueError(f'unknown encoder_type: {encoder_type!r}')
 
         # ------------------------------------------------------------------
-        # 2) Population context mixer (design rule 2 in the file docstring).
-        # ------------------------------------------------------------------
-        self.population_context = PopulationContext(self.d_model)
-
-        # ------------------------------------------------------------------
-        # 3) The time-conditioned gene-query predictor (design rule 1:
+        # 2) The time-conditioned gene-query predictor (design rule 1:
         #    this is the ONLY place the model learns about time).
         # ------------------------------------------------------------------
         self.predictor = GeneQueryPredictor(
@@ -273,7 +226,7 @@ class GeneQueryJEPA(nn.Module):
         )
 
         # ------------------------------------------------------------------
-        # 4) The learned "this gene is absent" answer. When we query a gene
+        # 3) The learned "this gene is absent" answer. When we query a gene
         #    that is NOT expressed at the target time, the correct answer is
         #    this vector.
         # ------------------------------------------------------------------
@@ -334,11 +287,7 @@ class GeneQueryJEPA(nn.Module):
         h_src = online_out['token_embedding']           # (B, Ls, D)
         z_src_cell = online_out['cell_embedding']       # (B, D)
 
-        # ---- Step 2: enrich the source with population context. ------------
-        source_memory = self.population_context(
-            token_embeddings=h_src,
-            cell_embeddings=z_src_cell,
-        )                                               # (B, Ls, D)
+        # ---- Step 2: predictor memory is H_src (no batch context). ---------
         source_is_padding = src_input_ids == PAD_TOKEN_ID   # (B, Ls)
 
         # ---- Step 3: EMA encoder reads the target cell (no gradients). -----
@@ -364,7 +313,7 @@ class GeneQueryJEPA(nn.Module):
         z_hat_gene = self.predictor(
             query_gene_embeddings=identity,
             time_step=time_step,
-            source_memory=source_memory,
+            source_memory=h_src,
             source_is_padding=source_is_padding,
         )                                               # (B, Q, D)
 
