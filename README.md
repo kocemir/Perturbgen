@@ -107,8 +107,7 @@ For usage, see the [documentation](https://perturbgen.cog.sanger.ac.uk/docs/exam
 see [docs/examples/GENE_QUERY_JEPA.md](docs/examples/GENE_QUERY_JEPA.md).
 
 ```shell
-python docs/examples/train_gene_query_jepa.py --data toy --split false
-python docs/examples/train_gene_query_jepa.py --data toy --split true
+python docs/examples/train_gene_query_jepa.py --data toy --batches-per-type 2 --batch-size 16
 python docs/examples/train_gene_query_jepa.py --data full --split false
 bash docs/examples/run_gene_query_toy_sweep.sh
 ```
