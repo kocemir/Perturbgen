@@ -1,0 +1,51 @@
+# Registry for KO_comparison.ipynb.
+# IL1B knockout at 90m LPS, predict 6h / 10h (pred_tps [1, 2]).
+#
+# MaskGIT: 90m-retrained PerturbGen stack.
+# JEPA: 90m 100ep + 200ep CountHead, four settings with --ko-resync-quiz.
+# Focus cell types: NKT, NK, CD8+ T cells (gamma-delta absent from dumps).
+
+gene_ensembl: ENSG00000125538
+gene_symbol: IL1B
+focus_cell_type: NK
+times:
+- 6h_LPS
+- 10h_LPS
+cytokine_markers:
+- IL1RN
+- IL1B
+- PTX3
+- IL32
+- IL7R
+- CXCL8
+- CXCL3
+- CXCL9
+maps:
+  token_id_to_ensembl: /mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/tokenized_data/lps_90min_perturb/token_id_to_genename_2000_hvg.pkl
+  symbol_to_ensembl: /mnt/sod2-project/csb4/stuke1/Geneformer/geneformer/gene_name_id_dict.pkl
+output_dir: /home/stuke1/perturbgen/Perturbgen/docs/examples/ko_comparison_res_90m_jepa100_qresync
+reference: maskgit
+pairs:
+- - jepa_srconly_pad
+  - jepa_srconly_mask
+- - jepa_copytgt_pad
+  - jepa_copytgt_mask
+experiments:
+  maskgit:
+    yaml: maskgit_il1b_src_90m.yaml
+  jepa_srconly_pad:
+    yaml: jepa_count_il1b_src_90m_srconly_pad.yaml
+  jepa_copytgt_pad:
+    yaml: jepa_count_il1b_src_90m_copytgt_pad.yaml
+  jepa_srconly_mask:
+    yaml: jepa_count_il1b_src_90m_srconly_mask.yaml
+  jepa_copytgt_mask:
+    yaml: jepa_count_il1b_src_90m_copytgt_mask.yaml
+focus_cell_types:
+- NKT
+- NK
+- CD8+ T cells
+focus_cell_types_note: "Cytokine-signaling boxplot left side: NKT cells, gamma-delta\
+  \ T cell, NK cells. lps_90min_perturb KO dumps have no gamma-delta T cell label;\
+  \ third slot uses CD8+ T cells (next present lymphoid type on that axis). Dump labels:\
+  \ NKT (n\u224816 @6h \u2014 thin), NK (n\u2248187), CD8+ T cells (n\u2248185)."

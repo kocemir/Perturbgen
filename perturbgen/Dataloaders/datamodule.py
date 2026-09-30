@@ -43,18 +43,9 @@ class PerturbGenDataset(Dataset):
         self.conditions_combined = conditions_combined
         self.condition_encodings = condition_encodings
         self.time_steps = time_steps
-        label_list = []
+        self.label_weights = None
         if split_indices is not None:
             self.src_dataset = src_dataset.select(split_indices)
-            # return labels for src dataset
-            if sampling_keys is not None:
-                label_list.append(
-                    self.get_label_weights(
-                        src_dataset,
-                        sampling_keys=sampling_keys,
-                    )
-                )
-
             self.tgt_datasets = {}
             self.tgt_counts_dict = {}
             if self.src_counts is not None:
@@ -66,13 +57,6 @@ class PerturbGenDataset(Dataset):
                 self.tgt_datasets[dataset_keys_] = tgt_datasets[dataset_keys_].select(
                     split_indices
                 )
-                if sampling_keys is not None:
-                    label_list.append(
-                        self.get_label_weights(
-                            tgt_datasets[dataset_keys_],
-                            sampling_keys=sampling_keys,
-                        )
-                    )
                 if tgt_counts_dict is not None:
                     self.tgt_counts_dict[count_keys_] = tgt_counts_dict[count_keys_][
                         split_indices, :
@@ -88,9 +72,25 @@ class PerturbGenDataset(Dataset):
         if src_len != tgt_len:
             warn('src and tgt dataset have different length')
         self.dataset_length = min(src_len, tgt_len)
-        if len(label_list) > 0:
-            # take the average of the weights
+        # Weights are always taken from the dataset that __getitem__ indexes.
+        # split_indices=None (or every row) and a real subset both stay in range.
+        if sampling_keys is not None:
+            label_list = [
+                self.get_label_weights(self.src_dataset, sampling_keys=sampling_keys)
+            ]
+            for t in time_steps:
+                label_list.append(
+                    self.get_label_weights(
+                        self.tgt_datasets[f'tgt_dataset_t{t}'],
+                        sampling_keys=sampling_keys,
+                    )
+                )
             self.label_weights = torch.mean(torch.stack(label_list), dim=0)
+            if len(self.label_weights) != self.dataset_length:
+                raise ValueError(
+                    'sampling weights do not match the dataset '
+                    f'({len(self.label_weights)} vs {self.dataset_length})'
+                )
 
     def get_label_weights(
         self,
@@ -160,7 +160,7 @@ class PerturbGenDataModule(LightningDataModule):
         batch_size: int = 64,
         num_workers: int = 8,
         shuffle: bool = False,
-        max_len: int = 2048,
+        max_len: int = 512,
         split: bool = False,
         pred_tps: list = [1, 2],
         n_total_tps: int = 4,
@@ -319,16 +319,20 @@ class PerturbGenDataModule(LightningDataModule):
         return data
 
     def val_dataloader(self):
+        # Do not reuse the train WeightedRandomSampler: its indices cover the
+        # training set, which is longer than val when --split true.
+        self.dataloader_kwargs['sampler'] = None
         self.dataloader_kwargs['dataset'] = self.val_dataset
         self.dataloader_kwargs['shuffle'] = False
         self.dataloader_kwargs['collate_fn'] = self.collate
-        if self.split:
+        if self.split and self.val_dataset is not None:
             data = DataLoader(**self.dataloader_kwargs)
             return data
         else:
             return []
 
     def test_dataloader(self):
+        self.dataloader_kwargs['sampler'] = None
         self.dataloader_kwargs['dataset'] = self.test_dataset
         self.dataloader_kwargs['collate_fn'] = self.collate
         data = DataLoader(**self.dataloader_kwargs, drop_last=True)
@@ -339,6 +343,8 @@ class PerturbGenDataModule(LightningDataModule):
         if src_dataset:
             src_input_batch_id = [torch.as_tensor(d['input_ids']) for d in src_dataset]
             src_length = torch.as_tensor([len(d['input_ids']) for d in src_dataset])
+            if isinstance(self.max_len, int):
+                src_length = src_length.clamp(max=self.max_len)
             model_input_size = torch.max(src_length)
             src_input_batch_id = pad_tensor_list(
                 src_input_batch_id, self.max_len, self.pad_token_id, model_input_size
@@ -400,7 +406,10 @@ class PerturbGenDataModule(LightningDataModule):
                         (seq != self.cls_token_id) & (seq != self.eos_token_id)
                     ]
                 tgt_input_ids_list.append(seq)
-                length.append(int(seq.size(0)))
+                seq_len = int(seq.size(0))
+                if isinstance(self.max_len, int):
+                    seq_len = min(seq_len, self.max_len)
+                length.append(seq_len)
             out[f'tgt_input_ids_t{time_step}'] = tgt_input_ids_list
             
             out[f'tgt_length_t{time_step}'] = torch.tensor(length)

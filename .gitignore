@@ -151,3 +151,19 @@ final_figs/miniforge.sh
 docs/examples/Raw_h5ad
 docs/examples/Raw.h5ad
 .vscode/
+
+# Local git copies / corrupt notebook backups
+.git.broken/
+*.corrupt.bak
+
+# Training / sweep dumps (keep scripts sitting at the folder root)
+docs/examples/jepa_full_res/*/
+docs/examples/jepa_toy_res/*/
+
+# Regenerated KO comparison figures
+docs/examples/ko_comparison_res/
+docs/examples/ko_comparison_res_*/
+
+# Ad-hoc analysis tables
+docs/examples/collapse_check*.csv
+

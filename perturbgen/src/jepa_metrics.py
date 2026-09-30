@@ -1,7 +1,7 @@
 """Gene-Query JEPA — VICReg variance/covariance (optional anti-collapse).
 
-Used by GeneQueryJEPATrainer when vicreg_var_coeff / vicreg_cov_coeff > 0.
-The hyperparameter sweep turns VICReg on/off; leave both coeffs at 0 to disable.
+Used by GeneQueryJEPATrainer on z_hat_cell (batch of predicted cell vectors).
+Set both coeffs to 0 to disable.
 
 Honesty metric is NOT here: it is val/gene_gap_vs_copy_src in the trainer.
 Index: docs/examples/GENE_QUERY_JEPA.md

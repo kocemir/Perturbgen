@@ -146,6 +146,14 @@ class CellEncoder(nn.Module):
         with torch.no_grad():
             self.token_embedding.weight[pad_token].zero_()
 
+    def unfreeze_used_layers(self) -> None:
+        for param in self.parameters():
+            param.requires_grad = True
+
+    def freeze_used_layers(self) -> None:
+        for param in self.parameters():
+            param.requires_grad = False
+
     def forward(
         self,
         input_ids: torch.Tensor,

@@ -94,6 +94,29 @@ class SCMaskGITCellEncoder(nn.Module):
             for param in self.model.parameters():
                 param.requires_grad = False
 
+    def used_parameters(self):
+        """Parameters that the encode path actually touches.
+
+        token_embedding + the first ``n_encoder_layers`` blocks. The deeper
+        blocks and the MaskGIT ``decoder_fc`` head never run here, so they
+        must stay frozen: under DDP with find_unused_parameters=False a
+        trainable-but-unused parameter aborts the step.
+        """
+        yield from self.model.token_embedding.parameters()
+        for block in self.model.decoder_block[: self.n_encoder_layers]:
+            yield from block.parameters()
+
+    def unfreeze_used_layers(self) -> None:
+        """Train embeddings + the early-exit blocks; keep unused depth frozen."""
+        for param in self.model.parameters():
+            param.requires_grad = False
+        for param in self.used_parameters():
+            param.requires_grad = True
+
+    def freeze_used_layers(self) -> None:
+        for param in self.model.parameters():
+            param.requires_grad = False
+
     def forward(
         self,
         input_ids: torch.Tensor,

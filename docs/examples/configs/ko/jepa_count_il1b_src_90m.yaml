@@ -1,0 +1,97 @@
+# Archived 004618 + 101130 JEPA KO dump (il1b_src_90m_retrain).
+# KO_comparison.ipynb no longer loads this file. Active settings are
+# jepa_count_il1b_src_90m_{srconly,copytgt}_{pad,mask}.yaml.
+#
+# JEPA + CountHead IL1B source knockout (notebook 09).
+#
+# 90m-retrained stack (pred_tps [1, 2] = 6h / 10h folder prefixes):
+#   JEPA  004618 epoch=08  (the ckpt the count head was trained on)
+#   Count 101130 epoch=09
+#
+# Run (pick a free GPU):
+#   cd /home/stuke1/perturbgen/Perturbgen
+#   python docs/examples/train_gene_query_jepa.py \
+#     --eval-count-ko true \
+#     --jepa-ckpt  <model.jepa_ckpt> \
+#     --count-ckpt <model.count_ckpt> \
+#     --tokenized  <data.tokenized> \
+#     --output-dir <trainer.output_dir> \
+#     --ko-gene ENSG00000125538 \
+#     --ko-replace mask \
+#     --ko-pred-tps 1 2 \
+#     --pred-tps 1,2 \
+#     --data full --split false --batch-size 64 --gpu 0
+
+experiment:
+  family: jepa
+  label: JEPA
+  gene_ensembl: ENSG00000125538
+  gene_symbol: IL1B
+  source_time: 90m_LPS
+  target_times: [6h_LPS, 10h_LPS]
+  perturbation_sequence: src
+  perturbation_mode: mask
+  dump_glob: "*_minference_adata_gENSG00000125538_ssrc_*mask.h5ad"
+  preferred_dump: "20260922-16:20_minference_adata_gENSG00000125538_ssrc_tmask.h5ad"
+  gene_id_space: local_token
+
+data:
+  tokenized: "/mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/tokenized_data/lps_90min_perturb"
+  src_dataset_file: "/mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/tokenized_data/lps_90min_perturb/dataset_2000_hvg_src/90m_LPS.dataset"
+  tgt_dataset_folder: "/mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/tokenized_data/lps_90min_perturb/dataset_2000_hvg_tgt"
+  src_adata: "/mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/tokenized_data/lps_90min_perturb/h5ad_pairing_2000_hvg_src/90m_LPS.h5ad"
+  tgt_adata_folder: "/mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/tokenized_data/lps_90min_perturb/h5ad_pairing_2000_hvg_tgt"
+
+trainer:
+  output_dir: "/mnt/sod2-project/csb4/stuke1/perturbgen/gene_query_jepa/count_decoder_runs/il1b_src_90m_retrain"
+  mapping_dict_path: "/mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/tokenized_data/lps_90min_perturb/token_id_to_genename_2000_hvg.pkl"
+  tokenid_to_rowid_path: "/mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/tokenized_data/lps_90min_perturb/tokenid_to_rowid_2000_hvg.pkl"
+  genes_to_perturb:
+    - "ENSG00000125538"
+  perturbation_sequence:
+    - "src"
+  perturbation_mode: "mask"
+  pred_tps:
+    - 1
+    - 2
+  max_len: 256
+  batch_size: 64
+  split: false
+
+model:
+  jepa_ckpt: "/mnt/sod2-project/csb4/stuke1/perturbgen/T_perturb/res/jepa_gene_query_90m_src/fzT_encL3_predL3_q128_mixed_lg1_lc0_contr0_vic0_bs16_ep20_lr0.0001_seed0_splitF_poolcls_tp1-2_src90m_20260921_004618/checkpoints/fzT_encL3_predL3_q128_mixed_lg1_lc0_contr0_vic0_bs16_ep20_lr0.0001_seed0_splitF_poolcls_tp1-2_src90m_20260921_004618-epoch=08-gap=0.1133.ckpt"
+  count_ckpt: "/mnt/sod2-project/csb4/stuke1/perturbgen/gene_query_jepa/count_decoder_runs/countdec_fzF_encL3_predL3_q128_mixed_lg1_lc0_contr0_vic0_bs64_ep40_lr0.001_seed0_splitF_poolcls_tp1-2_src90m_20260921_101130/checkpoints/countdec_fzF_encL3_predL3_q128_mixed_lg1_lc0_contr0_vic0_bs64_ep40_lr0.001_seed0_splitF_poolcls_tp1-2_src90m_20260921_101130-epoch=09-mse=6.0530.ckpt"
+
+cli:
+  cwd: /home/stuke1/perturbgen/Perturbgen
+  script: docs/examples/train_gene_query_jepa.py
+  args:
+    - --eval-count-ko
+    - "true"
+    - --jepa-ckpt
+    - "/mnt/sod2-project/csb4/stuke1/perturbgen/T_perturb/res/jepa_gene_query_90m_src/fzT_encL3_predL3_q128_mixed_lg1_lc0_contr0_vic0_bs16_ep20_lr0.0001_seed0_splitF_poolcls_tp1-2_src90m_20260921_004618/checkpoints/fzT_encL3_predL3_q128_mixed_lg1_lc0_contr0_vic0_bs16_ep20_lr0.0001_seed0_splitF_poolcls_tp1-2_src90m_20260921_004618-epoch=08-gap=0.1133.ckpt"
+    - --count-ckpt
+    - "/mnt/sod2-project/csb4/stuke1/perturbgen/gene_query_jepa/count_decoder_runs/countdec_fzF_encL3_predL3_q128_mixed_lg1_lc0_contr0_vic0_bs64_ep40_lr0.001_seed0_splitF_poolcls_tp1-2_src90m_20260921_101130/checkpoints/countdec_fzF_encL3_predL3_q128_mixed_lg1_lc0_contr0_vic0_bs64_ep40_lr0.001_seed0_splitF_poolcls_tp1-2_src90m_20260921_101130-epoch=09-mse=6.0530.ckpt"
+    - --tokenized
+    - "/mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/tokenized_data/lps_90min_perturb"
+    - --output-dir
+    - "/mnt/sod2-project/csb4/stuke1/perturbgen/gene_query_jepa/count_decoder_runs/il1b_src_90m_retrain"
+    - --ko-gene
+    - ENSG00000125538
+    - --ko-replace
+    - mask
+    - --ko-pred-tps
+    - "1"
+    - "2"
+    - --pred-tps
+    - "1,2"
+    - --data
+    - full
+    - --split
+    - "false"
+    - --batch-size
+    - "64"
+    - --gpu
+    - "0"
+    - --num-workers
+    - "2"

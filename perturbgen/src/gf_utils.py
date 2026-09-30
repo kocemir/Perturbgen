@@ -7,6 +7,9 @@ import torch
 logger = logging.getLogger(__name__)
 
 def pad_tensor(tensor, pad_token_id, max_len):
+    tensor = tensor.reshape(-1)
+    if tensor.numel() > max_len:
+        tensor = tensor[:max_len]
     tensor = torch.nn.functional.pad(
         tensor, pad=(0, max_len - tensor.numel()), mode="constant", value=pad_token_id
     )

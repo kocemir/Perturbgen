@@ -16,8 +16,7 @@
 # files below (90m_LPS.dataset / 90m_LPS.h5ad) exist.
 data:
   src_dataset_file: "/mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/tokenized_data/lps_90min_perturb/dataset_2000_hvg_src/90m_LPS.dataset" # 90-minute LPS SOURCE state (IL1B is expressed here)
-  # With REFERENCE_TIME=90m_LPS and full TIME_POINT_ORDER, targets are:
-  # 1_normal, 2_6h_LPS, 3_10h_LPS
+  # 90m-source tokenization folders: 1_6h_LPS, 2_10h_LPS (pred_tps 1, 2)
   tgt_dataset_folder: "/mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/tokenized_data/lps_90min_perturb/dataset_2000_hvg_tgt"
   src_adata: "/mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/tokenized_data/lps_90min_perturb/h5ad_pairing_2000_hvg_src/90m_LPS.h5ad" # source adata (90m_LPS)
   tgt_adata_folder: "/mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/tokenized_data/lps_90min_perturb/h5ad_pairing_2000_hvg_tgt"
@@ -41,7 +40,7 @@ trainer:
   # datasets and matches the manuscript's 90min config. Set them explicitly only
   # if you need to override the derived values.
   mask_scheduler: "pow" # masking scheduler type
-  output_dir: "/mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/res/perturbation/il1b_src_90m" # output directory for results
+  output_dir: "/mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/res/perturbation/il1b_src_90m_retrain" # 90m-retrained MaskGIT dumps
   mapping_dict_path: "/mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/tokenized_data/lps_90min_perturb/token_id_to_genename_2000_hvg.pkl" # mapping dictionary from the 90min tokenization step
   tokenid_to_rowid_path: "/mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/tokenized_data/lps_90min_perturb/tokenid_to_rowid_2000_hvg.pkl" # tokenid to rowid mapping from the 90min tokenization step
   encoder: "scmaskgit" # encoder type (Pretrain model)
@@ -61,10 +60,10 @@ trainer:
     - "cell_type_harmonized"
     - "cell_pairing_index"
     - "time_after_LPS"
-  # 90m source → 1_normal, 2_6h_LPS, 3_10h_LPS; predict 6h and 10h
+  # 90m source folders: 1_6h_LPS, 2_10h_LPS
   pred_tps:
+    - 1
     - 2
-    - 3
 
 
 datamodule:
@@ -79,11 +78,11 @@ datamodule:
     - "time_after_LPS"
     - "cell_pairing_index"
   pred_tps: # must match trainer.pred_tps
+    - 1
     - 2
-    - 3
 
 model:
   precision: 16 # precision for training
-  # Count-decoder ckpt from notebook 03 (best val/mse @ epoch=29).
+  # 90m-retrained count decoder (lps_ko_90m_split90_count, tp_1-2).
   # Key name is historical; this is the count trainer checkpoint.
-  ckpt_masking_path: "/mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/res/count_split/checkpoints/20260819_0949_cellgen_train_count_lr_0.001_wd_0.001_batch_128_drop_0.1_zinb_tp_1-2-3_s_0_pos_time_pos_sin_m_pow-epoch=24.ckpt"
+  ckpt_masking_path: "/mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/res/lps_ko_90m_split90_count/checkpoints/20260912_1351_cellgen_train_count_lr_0.001_wd_0.001_batch_64_drop_0.1_zinb_tp_1-2_s_0_pos_time_pos_sin_m_pow-epoch=24.ckpt"

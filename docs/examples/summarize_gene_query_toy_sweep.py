@@ -29,7 +29,7 @@ from typing import Dict, List, Optional
 
 DEFAULT_SUITE = (
     '/mnt/sod2-project/csb4/stuke1/perturbgen/'
-    'gene_query_jepa/toy_runs/systematic_144'
+    'gene_query_jepa/toy_runs/vic_fz5thenU_q128-256_L1-4_ep50'
 )
 GAP = 'val/gene_gap_vs_copy_src'
 WARMUP_EPOCH = 5
@@ -93,6 +93,7 @@ def summarise_run(run_dir: Path) -> Optional[Dict[str, object]]:
     return {
         'run_id': run_dir.name,
         'freeze': hp.get('FREEZE_ENCODER', ''),
+        'freeze_epochs': hp.get('FREEZE_ENCODER_EPOCHS', ''),
         'Q': hp.get('N_QUERIES', ''),
         'L': hp.get('ENC_LAYERS', ''),
         'contr': hp.get('LAMBDA_CONTRASTIVE', ''),
@@ -105,6 +106,8 @@ def summarise_run(run_dir: Path) -> Optional[Dict[str, object]]:
         'final_gap': final[GAP],
         'min_after_peak': min_after_peak,
         'final_gene_loss': final.get('val/gene_loss', float('nan')),
+        'final_gene_mse': final.get('val/gene_mse', float('nan')),
+        'predL': hp.get('PREDICTOR_LAYERS', ''),
         'verdict': verdict,
         'done': (run_dir / 'DONE').is_file(),
     }
@@ -132,16 +135,18 @@ def main() -> None:
     rows.sort(key=lambda r: r['final_gap'], reverse=True)
 
     print(
-        f'{"run_id":<34} {"warm":>8} {"final":>8} {"min>pk":>8} '
+        f'{"run_id":<28} {"warm":>8} {"final":>8} {"mse":>8} '
         f'{"ep":>3} {"verdict":>10}'
     )
-    print('-' * 78)
+    print('-' * 72)
     for r in rows:
+        mse = r['final_gene_mse']
+        mse_s = f'{mse:.4f}' if mse == mse else '     nan'
         print(
-            f'{r["run_id"]:<34} '
+            f'{r["run_id"]:<28} '
             f'{r["warm_gap"]:>+8.4f} '
             f'{r["final_gap"]:>+8.4f} '
-            f'{r["min_after_peak"]:>+8.4f} '
+            f'{mse_s:>8} '
             f'{r["n_epochs"]:>3} '
             f'{r["verdict"]:>10}'
         )

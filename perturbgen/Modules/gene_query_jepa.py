@@ -20,9 +20,9 @@ This model keeps the gene axis. The predictor is asked, gene by gene:
      the target time."
 
 Queries are three kinds per cell:
-      ~50%  genes present in BOTH source and target   (shared — shift)
-      ~30%  genes present ONLY in the target           (induced)
-      ~20%  genes absent from the target               (decoys)
+      ~40%  genes present in BOTH source and target   (shared — shift)
+      ~50%  genes present ONLY in the target           (induced)
+      ~10%  genes absent from the target               (placeholder; no loss)
 
 THE PICTURE
 -----------
@@ -36,15 +36,14 @@ THE PICTURE
    (batch, src_len, 768)                                    |
              |                                              v
              v                                  gene embeddings H_tgt
-        PREDICTOR  <-- query = e(g) + time_embed(t)         |
+        PREDICTOR  <-- Q gene queries + 1 cell query        |
    (cross-attention to H_src)                   (batch, tgt_len, 768) stop-grad
              |                                              |
              v                                              v
    predicted gene embeddings  ---- gene loss ---->  true gene embeddings
    z_hat_gene (batch, Q, 768)     (1 - cosine)     z_tgt_gene (batch, Q, 768)
              |                                    (or learned "absent" vector)
-             v
-   mean over present queries  ---- cell loss ---->  mean-pooled H_tgt
+   extra learned cell query  ---- cell loss ---->  encoder CLS of H_tgt
    z_hat_cell (batch, 768)        (1 - cosine)     z_tgt_cell (batch, 768)
 
 Design rules we committed to:
@@ -74,16 +73,28 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from perturbgen.Modules.transformer import Block
+
 # Token id 0 means "padding" in BOTH id spaces (global and local).
 PAD_TOKEN_ID = 0
+# PerturbGen decoder Block: YAML d_ff is attention dim_head, FFN is d_model.
+PREDICTOR_DIM_HEAD = 32
 
 
 class GeneQueryPredictor(nn.Module):
-    """Answer gene questions about the future.
+    """Answer gene (and one cell) questions about the future.
 
-    Each query = gene identity embedding + learned time embedding.
-    Queries cross-attend to the source cell's gene embeddings
-    and see each other through self-attention.
+    Each query = identity vector + learned time embedding.
+    Identity is a gene LUT row for the first Q slots, or the learned
+    ``cell_query`` for the extra slot. Queries cross-attend to the source
+    cell's gene embeddings and see each other through self-attention.
+
+    arch='torch' (default): ``nn.TransformerDecoder``, FFN = 4*d_model
+    (3072 at d_model=768). This is what every run up to 2026-09-22 used.
+    arch='block' is the PerturbGen MaskGIT ``Block`` (attention dim_head=32,
+    FFN=d_model); only the 2026-09-25 run was trained with it, and it stays
+    here so that checkpoint still loads. The frozen scMaskGIT encoder is
+    dim_head=96 either way (pretrain ckpt).
     """
 
     def __init__(
@@ -93,26 +104,46 @@ class GeneQueryPredictor(nn.Module):
         num_layers: int = 2,
         num_heads: int = 8,
         dropout: float = 0.0,
+        dim_head: int = PREDICTOR_DIM_HEAD,
+        arch: Literal['block', 'torch'] = 'torch',
     ):
         super().__init__()
+        if arch not in ('block', 'torch'):
+            raise ValueError(f'predictor arch must be block or torch, got {arch!r}')
+        self.arch = arch
         self.time_embedding = nn.Embedding(n_time_steps + 1, d_model)
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model,
-            nhead=num_heads,
-            dim_feedforward=d_model * 4,
-            activation='gelu',
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.cross_attention = nn.TransformerDecoder(
-            decoder_layer,
-            num_layers=num_layers,
-            norm=nn.LayerNorm(d_model),
-        )
+        if arch == 'block':
+            self.decoder_block = nn.ModuleList(
+                [
+                    Block(
+                        dim=d_model,
+                        num_heads=num_heads,
+                        d_ff=dim_head,
+                        hidden_size=d_model,
+                        dropout=dropout,
+                        return_attn=False,
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
+        else:
+            decoder_layer = nn.TransformerDecoderLayer(
+                d_model=d_model,
+                nhead=num_heads,
+                dim_feedforward=d_model * 4,
+                activation='gelu',
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.cross_attention = nn.TransformerDecoder(
+                decoder_layer,
+                num_layers=num_layers,
+                norm=nn.LayerNorm(d_model),
+            )
 
     def forward(
         self,
-        query_gene_embeddings: torch.Tensor,  # (B, Q, D)  gene identity e(g)
+        query_gene_embeddings: torch.Tensor,  # (B, Q or Q+1, D) identity vectors
         time_step: int,                       # scalar: 1, 2, or 3
         source_memory: torch.Tensor,          # (B, Ls, D) source gene embeddings
         source_is_padding: torch.Tensor,      # (B, Ls)    True where src is pad
@@ -122,12 +153,20 @@ class GeneQueryPredictor(nn.Module):
         )
         time_vector = self.time_embedding(time_index)         # (1, D)
         queries = query_gene_embeddings + time_vector         # (B, Q, D)
-
-        predicted = self.cross_attention(
-            tgt=queries,
-            memory=source_memory,
-            memory_key_padding_mask=source_is_padding,
-        )
+        if self.arch == 'torch':
+            return self.cross_attention(
+                tgt=queries,
+                memory=source_memory,
+                memory_key_padding_mask=source_is_padding,
+            )
+        predicted = queries
+        for dec_layer in self.decoder_block:
+            predicted, _, _ = dec_layer(
+                x=predicted,
+                src_mask=source_is_padding,
+                tgt_mask=None,
+                enc_output=source_memory,
+            )
         return predicted                                      # (B, Q, D)
 
 
@@ -159,15 +198,18 @@ class GeneQueryJEPA(nn.Module):
         num_heads: int = 8,
         num_layers: int = 2,
         d_ff: int = 1024,
-        max_seq_length: int = 2048,
-        cell_pool: str = 'mean',
+        max_seq_length: int = 512,
+        cell_pool: str = 'cls',
         cls_token_id: int = 2,
+        predictor_arch: Literal['block', 'torch'] = 'torch',
+        use_query_src_pos: bool = True,
     ):
         super().__init__()
         self.ema_decay = ema_decay
         self.normalize_latents = normalize_latents
         self.encoder_type = encoder_type
         self.cell_pool = cell_pool
+        self.use_query_src_pos = bool(use_query_src_pos)
 
         # ------------------------------------------------------------------
         # 1) The two encoders: online (trains) and EMA target (frozen copy).
@@ -217,12 +259,14 @@ class GeneQueryJEPA(nn.Module):
         # 2) The time-conditioned gene-query predictor (design rule 1:
         #    this is the ONLY place the model learns about time).
         # ------------------------------------------------------------------
+        self.predictor_arch = predictor_arch
         self.predictor = GeneQueryPredictor(
             d_model=self.d_model,
             n_time_steps=n_time_steps,
             num_layers=predictor_layers,
             num_heads=predictor_heads,
             dropout=dropout,
+            arch=predictor_arch,
         )
 
         # ------------------------------------------------------------------
@@ -233,6 +277,19 @@ class GeneQueryJEPA(nn.Module):
         self.absent_gene_embedding = nn.Parameter(
             torch.randn(self.d_model) * 0.02
         )
+        # Extra predictor query (not a gene LUT row, not encoder token id 2).
+        self.cell_query = nn.Parameter(torch.randn(1, 1, self.d_model) * 0.02)
+        # Mask-CE query: no gene identity; shares the src-rank table below.
+        self.mask_query = nn.Parameter(torch.randn(1, 1, self.d_model) * 0.02)
+        # Learnable source-rank PE for EVERY gene query (not target rank).
+        # Indices 0..max_seq_length-1 = rank in the source sequence.
+        # Last index = "gene absent from source" (src_position < 0).
+        # Kept small (std=0.02) so it does not drown gene identity / time.
+        pos_slots = max(int(max_seq_length), 2048) + 1
+        self.query_src_pos_embedding = nn.Embedding(pos_slots, self.d_model)
+        nn.init.normal_(self.query_src_pos_embedding.weight, std=0.02)
+        # Alias for older mask-CE checkpoints / trainer freeze paths.
+        self.mask_src_pos_embedding = self.query_src_pos_embedding
 
     # ----------------------------------------------------------------------
     # Small helpers
@@ -249,6 +306,19 @@ class GeneQueryJEPA(nn.Module):
             return F.normalize(x, dim=-1)
         return x
 
+    def _src_rank_pe(self, query_src_position: torch.Tensor) -> torch.Tensor:
+        """Learnable PE from source expression rank. (B, Q) -> (B, Q, D).
+
+        ``query_src_position < 0`` means the gene is absent from the source
+        cell; those slots use the last embedding row (dedicated absent code).
+        """
+        n_pos = self.query_src_pos_embedding.num_embeddings
+        absent_idx = n_pos - 1
+        safe = query_src_position.clone()
+        safe = torch.where(safe < 0, torch.full_like(safe, absent_idx), safe)
+        safe = safe.clamp(0, absent_idx)
+        return self.query_src_pos_embedding(safe)
+
     @torch.no_grad()
     def update_target_encoder(self) -> None:
         """Move the EMA encoder a tiny step towards the online encoder.
@@ -263,6 +333,21 @@ class GeneQueryJEPA(nn.Module):
             target_param.data.mul_(self.ema_decay)
             target_param.data.add_(online_param.data, alpha=1.0 - self.ema_decay)
 
+    def unfreeze_online_encoder(self) -> None:
+        """Unfreeze the student encoder used layers (EMA target stays frozen)."""
+        if hasattr(self.online_encoder, 'unfreeze_used_layers'):
+            self.online_encoder.unfreeze_used_layers()
+            return
+        for parameter in self.online_encoder.parameters():
+            parameter.requires_grad = True
+
+    def freeze_online_encoder(self) -> None:
+        if hasattr(self.online_encoder, 'freeze_used_layers'):
+            self.online_encoder.freeze_used_layers()
+            return
+        for parameter in self.online_encoder.parameters():
+            parameter.requires_grad = False
+
     # ----------------------------------------------------------------------
     # The forward pass for ONE target timepoint.
     # The trainer calls this once per timepoint (t = 1, 2, 3).
@@ -275,6 +360,8 @@ class GeneQueryJEPA(nn.Module):
         query_is_present: torch.Tensor,   # (B, Q)  True if gene really is in tgt
         query_tgt_position: torch.Tensor, # (B, Q)  where in tgt_input_ids it sits
         time_step: int,                   # which target timepoint (1, 2 or 3)
+        query_is_mask_ce: Optional[torch.Tensor] = None,  # (B, Q) mask-CE slots
+        query_src_position: Optional[torch.Tensor] = None,  # (B, Q) src index
     ) -> Dict[str, torch.Tensor]:
         """Run the whole diagram once. Returns every arrow's endpoint.
 
@@ -307,27 +394,41 @@ class GeneQueryJEPA(nn.Module):
         is_present = query_is_present.unsqueeze(-1)     # (B, Q, 1)
         z_tgt_gene = torch.where(is_present, true_gene_embedding, absent_answer)
 
-        # ---- Step 5: build query = gene identity + time, then predict. ------
+        # ---- Step 5: Q gene identities + optional src-rank PE + 1 cell query.
         identity_table = self._gene_identity_table(self.online_encoder)
         identity = identity_table(query_gene_ids)              # (B, Q, D)
-        z_hat_gene = self.predictor(
-            query_gene_embeddings=identity,
+        if query_is_mask_ce is not None and bool(query_is_mask_ce.any()):
+            # Drop gene identity for mask-CE slots; keep only mask_query (+ PE).
+            mask_q = self.mask_query.expand(batch_size, n_queries, -1)
+            identity = torch.where(
+                query_is_mask_ce.unsqueeze(-1), mask_q, identity
+            )
+        if (
+            self.use_query_src_pos
+            and query_src_position is not None
+        ):
+            identity = identity + self._src_rank_pe(query_src_position)
+        cell_query = self.cell_query.expand(batch_size, 1, -1)  # (B, 1, D)
+        queries = torch.cat([identity, cell_query], dim=1)     # (B, Q+1, D)
+        predicted = self.predictor(
+            query_gene_embeddings=queries,
             time_step=time_step,
             source_memory=h_src,
             source_is_padding=source_is_padding,
-        )                                               # (B, Q, D)
+        )                                               # (B, Q+1, D)
+        z_hat_gene_raw = predicted[:, :-1]              # (B, Q, D)
+        z_hat_cell_raw = predicted[:, -1]               # (B, D)
+        z_tgt_gene_raw = z_tgt_gene
+        z_tgt_cell_raw = z_tgt_cell
+        z_src_cell_raw = z_src_cell
+        h_src_raw = h_src
 
-        # ---- Step 6: cell-level view = average over the present queries. ---
-        present_mask = query_is_present.unsqueeze(-1).float()    # (B, Q, 1)
-        n_present = present_mask.sum(dim=1).clamp(min=1.0)       # (B, 1)
-        z_hat_cell = (z_hat_gene * present_mask).sum(dim=1) / n_present  # (B, D)
-
-        # ---- Step 7: normalise everything that enters a cosine loss. -------
-        z_hat_gene = self._maybe_normalize(z_hat_gene)
-        z_tgt_gene = self._maybe_normalize(z_tgt_gene)
-        z_hat_cell = self._maybe_normalize(z_hat_cell)
-        z_tgt_cell = self._maybe_normalize(z_tgt_cell)
-        z_src_cell = self._maybe_normalize(z_src_cell)
+        # ---- Step 7: normalise copies that enter cosine / CE. -------------
+        z_hat_gene = self._maybe_normalize(z_hat_gene_raw)
+        z_tgt_gene = self._maybe_normalize(z_tgt_gene_raw)
+        z_hat_cell = self._maybe_normalize(z_hat_cell_raw)
+        z_tgt_cell = self._maybe_normalize(z_tgt_cell_raw)
+        z_src_cell = self._maybe_normalize(z_src_cell_raw)
 
         # ---- Step 8 (metrics only): the "no learning" baselines. -----------
         with torch.no_grad():
@@ -337,11 +438,17 @@ class GeneQueryJEPA(nn.Module):
             )                                           # (B, Q, D)
 
         return {
-            'z_hat_gene': z_hat_gene,       # (B, Q, D) predicted gene embeddings
-            'z_tgt_gene': z_tgt_gene,       # (B, Q, D) true gene embeddings (EMA)
-            'z_hat_cell': z_hat_cell,       # (B, D)    predicted cell embedding
-            'z_tgt_cell': z_tgt_cell,       # (B, D)    true cell embedding (EMA)
-            'z_src_cell': z_src_cell,       # (B, D)    source cell embedding
-            'h_src': self._maybe_normalize(h_src),  # (B, Ls, D) for baselines
-            'z_static_gene': z_static_gene, # (B, Q, D) context-free baseline
+            'z_hat_gene': z_hat_gene,
+            'z_tgt_gene': z_tgt_gene,
+            'z_hat_gene_raw': z_hat_gene_raw,
+            'z_tgt_gene_raw': z_tgt_gene_raw,
+            'z_hat_cell': z_hat_cell,
+            'z_tgt_cell': z_tgt_cell,
+            'z_src_cell': z_src_cell,
+            'z_hat_cell_raw': z_hat_cell_raw,
+            'z_tgt_cell_raw': z_tgt_cell_raw,
+            'z_src_cell_raw': z_src_cell_raw,
+            'h_src': self._maybe_normalize(h_src_raw),
+            'h_src_raw': h_src_raw,
+            'z_static_gene': z_static_gene,
         }
