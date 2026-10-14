@@ -195,26 +195,28 @@ def test_sampler_mix_and_positions():
     assert len(gene_ids) == 8
     assert sum(is_present) == 4
     assert sum(1 for p in is_present if not p) == 4
-    assert 'is_valid' not in quiz
+    # No filler needed here (46 candidate decoys), so every slot is valid.
+    assert quiz['is_valid'][0].all()
     assert not quiz['is_mask_ce'][0].any()
 
     tgt_genes = {4, 5, 10, 11}
+    src_genes = {4, 5, 6, 9}
     for gene, present, pos_t, pos_s in zip(
         gene_ids, is_present, tgt_position, src_position
     ):
+        # src_position describes the SOURCE only, for present and absent alike.
+        if gene in src_genes:
+            assert pos_s >= 0
+            local_of_src_token = global_to_local[src[0, pos_s]].item()
+            assert local_of_src_token == gene
+        else:
+            assert pos_s == -1
         if present:
             assert gene in tgt_genes
             assert tgt[0, pos_t].item() == gene
-            if gene in (4, 5):
-                assert pos_s >= 0
-                local_of_src_token = global_to_local[src[0, pos_s]].item()
-                assert local_of_src_token == gene
-            else:
-                assert pos_s == -1
         else:
             assert gene not in tgt_genes
             assert pos_t == 0
-            assert pos_s == -1
 
 
 def test_mask_frac_marks_shared_only():
@@ -735,3 +737,398 @@ def test_count_input_modes():
     from perturbgen.Model.gene_query_count_trainer import COUNT_INPUT_MODES
 
     assert COUNT_INPUT_MODES == ('source_only', 'copy_target')
+
+
+# ==========================================================================
+# source_blind quiz + absent supervision (Sep-30 redesign)
+# ==========================================================================
+ALL_GENES = list(range(FIRST_REAL_GENE_LOCAL_ID, FIRST_REAL_GENE_LOCAL_ID + N_GENES))
+
+
+def _blind_quiz(src, tgt, n_queries=8, n_src=6, seed=0, **extra):
+    _, global_to_local, _ = make_id_maps()
+    return sample_query_batch(
+        src_input_ids_global=src,
+        tgt_input_ids_local=tgt,
+        global_to_local=global_to_local,
+        all_gene_local_ids=ALL_GENES,
+        n_queries=n_queries,
+        frac_shared=0.4,          # ignored by source_blind
+        frac_tgt_only=0.5,        # ignored by source_blind
+        rng=random.Random(seed),
+        query_sampling='source_blind',
+        n_src_queries=n_src,
+        **extra,
+    )
+
+
+def test_source_blind_selection_ignores_target():
+    """Same source + same seed -> identical questions whatever the target says."""
+    src = torch.tensor([[2, 100, 101, 102, 105, 0]])          # LOCAL 4,5,6,9
+    tgt_a = torch.tensor([[2, 4, 5, 10, 11, 0]])
+    tgt_b = torch.tensor([[2, 20, 21, 22, 23, 0]])             # disjoint target
+    quiz_a = _blind_quiz(src, tgt_a, mask_frac_of_shared=0.5)
+    quiz_b = _blind_quiz(src, tgt_b, mask_frac_of_shared=0.5)
+    for key in ('gene_ids_local', 'src_position', 'is_mask_ce', 'is_valid'):
+        assert torch.equal(quiz_a[key], quiz_b[key]), key
+    # Labels are the only thing that may differ.
+    assert quiz_a['is_present'].sum() > 0
+    assert quiz_b['is_present'].sum() == 0
+
+
+def test_source_blind_positions_and_labels():
+    _, global_to_local, _ = make_id_maps()
+    src = torch.tensor([[2, 100, 101, 102, 105, 0]])          # LOCAL 4,5,6,9 at 1..4
+    tgt = torch.tensor([[2, 4, 5, 10, 11, 0]])
+    quiz = _blind_quiz(src, tgt, n_queries=8, n_src=6)
+    gene_ids = quiz['gene_ids_local'][0].tolist()
+    src_pos = quiz['src_position'][0].tolist()
+    present = quiz['is_present'][0].tolist()
+    tgt_pos = quiz['tgt_position'][0].tolist()
+
+    assert quiz['is_valid'][0].all()
+    assert len(set(gene_ids)) == 8                             # no repeats
+    src_genes = {4, 5, 6, 9}
+    # Source has only 4 genes -> all 4 asked, remaining 4 from non-source genes.
+    assert sum(g in src_genes for g in gene_ids) == 4
+    for gene, pos_s, is_p, pos_t in zip(gene_ids, src_pos, present, tgt_pos):
+        if gene in src_genes:
+            assert global_to_local[src[0, pos_s]].item() == gene
+        else:
+            assert pos_s == -1
+        assert is_p == (gene in {4, 5, 10, 11})
+        if is_p:
+            assert tgt[0, pos_t].item() == gene
+        else:
+            assert pos_t == 0
+    # Shared genes are present with rank >= 0; genes 6 and 9 are present in the
+    # source but ABSENT in the target -> the "gene turns off" case.
+    off = [g for g, p in zip(gene_ids, present) if g in (6, 9)]
+    assert off and all(not present[gene_ids.index(g)] for g in off)
+
+
+def test_source_blind_filler_marked_invalid():
+    """Tiny universe: pools run dry -> filler slots exist and are invalid."""
+    _, global_to_local, _ = make_id_maps()
+    src = torch.tensor([[2, 100, 101, 102, 105, 0]])          # LOCAL 4,5,6,9
+    tgt = torch.tensor([[2, 4, 5, 10, 0, 0]])
+    quiz = sample_query_batch(
+        src_input_ids_global=src,
+        tgt_input_ids_local=tgt,
+        global_to_local=global_to_local,
+        all_gene_local_ids=[4, 5, 6, 9, 10],                    # only 1 non-source gene
+        n_queries=8,
+        frac_shared=0.4,
+        frac_tgt_only=0.5,
+        rng=random.Random(0),
+        query_sampling='source_blind',
+        n_src_queries=6,
+    )
+    valid = quiz['is_valid'][0]
+    assert int(valid.sum()) == 5                               # 4 source + 1 non-source
+    assert not quiz['is_present'][0][~valid].any()
+    assert (quiz['src_position'][0][~valid] == -1).all()
+    assert not quiz['is_mask_ce'][0][~valid].any()
+
+
+def test_source_blind_weights_bias_nonsource_draws():
+    src = torch.tensor([[2, 100, 101, 102, 105, 0]])          # LOCAL 4,5,6,9
+    tgt = torch.tensor([[2, 4, 5, 0, 0, 0]])
+    weights = torch.full((FIRST_REAL_GENE_LOCAL_ID + N_GENES,), 1e-6)
+    weights[40] = 1.0                                          # one hot favourite
+    weights[41] = 1.0
+    hits = 0
+    for seed in range(10):
+        quiz = _blind_quiz(src, tgt, n_queries=6, n_src=4, seed=seed, nonsrc_weights=weights)
+        drawn = set(quiz['gene_ids_local'][0].tolist()) - {4, 5, 6, 9}
+        assert len(drawn) == 2
+        hits += int(drawn == {40, 41})
+    assert hits == 10
+    # Weighting is reproducible through the Python seed.
+    a = _blind_quiz(src, tgt, n_queries=6, n_src=4, seed=3, nonsrc_weights=weights)
+    b = _blind_quiz(src, tgt, n_queries=6, n_src=4, seed=3, nonsrc_weights=weights)
+    assert torch.equal(a['gene_ids_local'], b['gene_ids_local'])
+
+
+def test_source_blind_mask_ce_marks_source_queries_only():
+    src = torch.tensor([[2, 100, 101, 102, 105, 0]])
+    tgt = torch.tensor([[2, 4, 5, 10, 11, 0]])
+    quiz = _blind_quiz(src, tgt, n_queries=8, n_src=4, mask_frac_of_shared=1.0)
+    is_mask = quiz['is_mask_ce'][0]
+    assert int(is_mask.sum()) == 4
+    assert (quiz['src_position'][0][is_mask] >= 0).all()
+    assert not (quiz['src_position'][0][~is_mask] >= 0).any()
+
+
+# --------------------------------------------------------------------------
+# n_top_common_queries: deterministic "likely present" slot (Oct-12 redesign)
+# --------------------------------------------------------------------------
+def test_source_blind_top_common_zero_matches_legacy_path():
+    """n_top_common_queries=0 (the default) reproduces the pre-redesign draw
+    bit-for-bit given the same seed and weights."""
+    src = torch.tensor([[2, 100, 101, 102, 105, 0]])
+    tgt = torch.tensor([[2, 4, 5, 0, 0, 0]])
+    weights = torch.full((FIRST_REAL_GENE_LOCAL_ID + N_GENES,), 1e-6)
+    weights[40] = 1.0
+    weights[41] = 1.0
+    a = _blind_quiz(src, tgt, n_queries=6, n_src=4, seed=3, nonsrc_weights=weights)
+    b = _blind_quiz(
+        src, tgt, n_queries=6, n_src=4, seed=3, nonsrc_weights=weights,
+        n_top_common_queries=0,
+    )
+    assert torch.equal(a['gene_ids_local'], b['gene_ids_local'])
+
+
+def test_source_blind_top_common_is_deterministic_and_distinct():
+    """n_top_common_queries picks the K highest-``nonsrc_weights`` non-source
+    genes every time (no randomness), never colliding with chosen_src."""
+    src = torch.tensor([[2, 100, 101, 102, 105, 0]])          # LOCAL 4,5,6,9
+    tgt = torch.tensor([[2, 4, 5, 10, 11, 12, 0]])
+    # Strictly increasing in LOCAL id -> the top-K is unambiguous.
+    weights = torch.arange(FIRST_REAL_GENE_LOCAL_ID + N_GENES, dtype=torch.float)
+    src_genes = {4, 5, 6, 9}
+    universe = range(FIRST_REAL_GENE_LOCAL_ID, FIRST_REAL_GENE_LOCAL_ID + N_GENES)
+    expected_top = set(sorted(g for g in universe if g not in src_genes)[-3:])
+
+    for seed in range(5):
+        quiz = _blind_quiz(
+            src, tgt, n_queries=8, n_src=4, seed=seed,
+            nonsrc_weights=weights, n_top_common_queries=3,
+        )
+        gene_ids = quiz['gene_ids_local'][0].tolist()
+        assert len(set(gene_ids)) == 8                         # no duplicates
+        non_source = [g for g in gene_ids if g not in src_genes]
+        assert len(non_source) == 4                            # 8 - 4 source
+        assert expected_top.issubset(set(non_source))          # same every seed
+
+
+def test_source_blind_top_common_leaves_rest_to_lowfreq_weights():
+    """The non-top-common remainder is drawn with ``lowfreq_weights``,
+    independent of (and never overlapping with) the top-common genes."""
+    src = torch.tensor([[2, 100, 101, 102, 105, 0]])          # LOCAL 4,5,6,9
+    tgt = torch.tensor([[2, 4, 5, 0, 0, 0]])
+    present_weights = torch.full((FIRST_REAL_GENE_LOCAL_ID + N_GENES,), 1e-6)
+    present_weights[10] = 1.0                                  # sole top-common pick
+    absent_weights = torch.full((FIRST_REAL_GENE_LOCAL_ID + N_GENES,), 1e-6)
+    absent_weights[40] = 1.0
+    absent_weights[41] = 1.0
+    hits = 0
+    for seed in range(10):
+        quiz = _blind_quiz(
+            src, tgt, n_queries=7, n_src=4, seed=seed,
+            nonsrc_weights=present_weights,
+            n_top_common_queries=1,
+            lowfreq_weights=absent_weights,
+        )
+        gene_ids = quiz['gene_ids_local'][0].tolist()
+        assert len(set(gene_ids)) == 7
+        assert 10 in gene_ids                                  # deterministic top-1
+        drawn_lowfreq = set(gene_ids) - {4, 5, 6, 9, 10}
+        assert len(drawn_lowfreq) == 2
+        hits += int(drawn_lowfreq == {40, 41})
+    assert hits == 10
+
+
+def test_source_blind_n_top_common_queries_validates_range():
+    _, global_to_local, _ = make_id_maps()
+    src = torch.tensor([[2, 100, 101, 102, 105, 0]])
+    tgt = torch.tensor([[2, 4, 5, 0, 0, 0]])
+    with pytest.raises(ValueError, match='n_top_common_queries'):
+        sample_query_batch(
+            src_input_ids_global=src,
+            tgt_input_ids_local=tgt,
+            global_to_local=global_to_local,
+            all_gene_local_ids=ALL_GENES,
+            n_queries=8,
+            frac_shared=0.4,
+            frac_tgt_only=0.5,
+            rng=random.Random(0),
+            query_sampling='source_blind',
+            n_src_queries=4,
+            n_top_common_queries=5,    # > n_queries - n_src_queries (4)
+        )
+
+
+def test_trainer_n_top_common_queries_requires_n_src_queries():
+    # query_sampling='target' never auto-fills n_src_queries, so it stays
+    # None and the check must fire before any encoder/path args are needed.
+    with pytest.raises(ValueError, match='n_top_common_queries'):
+        GeneQueryJEPATrainer(
+            jepa_encoder='cell',
+            n_queries=8,
+            query_sampling='target',
+            n_top_common_queries=2,
+        )
+
+
+def test_sampler_rejects_unknown_mode():
+    src = torch.tensor([[2, 100, 0]])
+    tgt = torch.tensor([[2, 4, 0]])
+    with pytest.raises(ValueError):
+        sample_query_batch(
+            src_input_ids_global=src,
+            tgt_input_ids_local=tgt,
+            global_to_local=make_id_maps()[1],
+            all_gene_local_ids=ALL_GENES,
+            n_queries=4,
+            frac_shared=0.4,
+            frac_tgt_only=0.5,
+            rng=random.Random(0),
+            query_sampling='nope',
+        )
+
+
+@pytest.fixture()
+def blind_trainer(tmp_path):
+    """source_blind quiz + absent loss, MSE gene loss, tiny CPU encoder."""
+    tokenid_to_rowid, _, _ = make_id_maps()
+    map_path = tmp_path / 'tokenid_to_rowid_test.pkl'
+    with open(map_path, 'wb') as f:
+        pickle.dump(tokenid_to_rowid, f)
+    return GeneQueryJEPATrainer(
+        jepa_encoder='cell',
+        n_queries=8,
+        pred_tps=[1],
+        n_total_tps=3,
+        tokenid_to_rowid_path=str(map_path),
+        output_dir=str(tmp_path / 'out'),
+        tgt_vocab_size=60,
+        d_model=32,
+        num_heads=4,
+        num_layers=1,
+        d_ff=64,
+        max_seq_length=64,
+        seed=0,
+        cell_pool='cls',
+        gene_loss='mse',
+        query_sampling='source_blind',
+        n_src_queries=6,
+        lambda_absent=0.5,
+    )
+
+
+def test_absent_null_is_frozen_buffer_at_layernorm_scale(blind_trainer):
+    model = blind_trainer.model
+    names = {name for name, _ in blind_trainer.named_parameters()}
+    assert 'model.absent_gene_embedding' not in names
+    assert 'model.absent_gene_embedding' in blind_trainer.state_dict()
+    null = model.absent_gene_embedding
+    assert not null.requires_grad
+    assert torch.isclose(null.norm(), torch.tensor(32.0 ** 0.5), atol=1e-4)
+    result = blind_trainer._run_one_timestep(make_fake_batch(), time_step=1)
+    result['total_loss'].backward()
+    assert null.grad is None
+    # Legacy trainer default keeps the old objective: absent weight 0.
+    assert blind_trainer.lambda_absent == 0.5
+
+
+def test_absent_loss_targets_absent_slots_only(blind_trainer):
+    batch = make_fake_batch()
+    result = blind_trainer._run_one_timestep(batch, time_step=1)
+    present = result['_is_present']
+    absent = result['_absent_mask']
+    valid = result['_is_valid']
+    assert valid.all()
+    assert not (present & absent).any()
+    assert (present | absent).all()                             # no mask-CE here
+    assert absent.any() and present.any()
+
+    out = result['_out']
+    per_query_mse = (out['z_hat_gene_raw'] - out['z_tgt_gene_raw']).pow(2).mean(-1)
+    expected_gene = (per_query_mse * present).sum() / present.sum()
+    expected_absent = (per_query_mse * absent).sum() / absent.sum()
+    assert torch.allclose(result['gene_loss'], expected_gene, atol=1e-5)
+    assert torch.allclose(result['absent_loss'], expected_absent, atol=1e-5)
+    # Absent targets are the null itself.
+    null = blind_trainer.model.absent_gene_embedding
+    assert torch.allclose(out['z_tgt_gene_raw'][absent], null.expand_as(out['z_tgt_gene_raw'][absent]))
+    # And the null enters the objective with lambda_absent.
+    others = (
+        blind_trainer.lambda_gene * result['gene_loss']
+        + blind_trainer.lambda_absent * result['absent_loss']
+        + blind_trainer.lambda_cell * result['cell_loss']
+        + blind_trainer.lambda_contrastive * result['contrastive_loss']
+        + blind_trainer.lambda_mask_ce * result['mask_ce_loss']
+    )
+    assert torch.allclose(result['total_loss'], others, atol=1e-5)
+    for key in ('absent_cos_null', 'present_cos_null', 'quiz_absent_frac',
+                'quiz_p_present_neg', 'quiz_p_present_pos'):
+        assert torch.isfinite(result[key]), key
+    assert 0.0 <= result['quiz_absent_frac'] <= 1.0
+
+
+def test_load_checkpoint_drops_surplus_src_pos_rows(tiny_trainer):
+    """A ckpt saved with one extra PE row (1 Oct 14:30 run) still loads."""
+    state = {k: v.clone() for k, v in tiny_trainer.state_dict().items()}
+    weight = state['model.query_src_pos_embedding.weight']
+    extra = torch.cat([weight, torch.full((1, weight.size(1)), 7.0)], dim=0)
+    state['model.query_src_pos_embedding.weight'] = extra
+    state['model.mask_src_pos_embedding.weight'] = extra.clone()
+    tiny_trainer.on_load_checkpoint({'state_dict': state})
+    tiny_trainer.load_state_dict(state)
+    assert tiny_trainer.model.query_src_pos_embedding.weight.size(0) == weight.size(0)
+    assert torch.equal(tiny_trainer.model.query_src_pos_embedding.weight, weight)
+
+
+def test_legacy_default_has_no_absent_loss(tiny_trainer):
+    assert tiny_trainer.query_sampling == 'target'
+    assert tiny_trainer.lambda_absent == 0.0
+    result = tiny_trainer._run_one_timestep(make_fake_batch(), time_step=1)
+    assert torch.isfinite(result['absent_loss'])
+    expected = (
+        tiny_trainer.lambda_gene * result['gene_loss']
+        + tiny_trainer.lambda_cell * result['cell_loss']
+    )
+    assert torch.allclose(result['total_loss'], expected, atol=1e-5)
+
+
+def test_source_blind_encode_one_timestep_masks(blind_trainer):
+    result = blind_trainer.encode_one_timestep(make_fake_batch(), time_step=1)
+    assert '_is_valid' in result and '_absent_mask' in result
+    assert not (result['_is_present'] & result['_absent_mask']).any()
+    assert not result['_quiz']['is_mask_ce'].any()
+
+
+def test_nonsrc_freq_table_roundtrip_and_lookup(tmp_path):
+    tokenid_to_rowid, _, _ = make_id_maps()
+    map_path = tmp_path / 'tokenid_to_rowid_test.pkl'
+    with open(map_path, 'wb') as f:
+        pickle.dump(tokenid_to_rowid, f)
+    vocab = FIRST_REAL_GENE_LOCAL_ID + N_GENES
+    table = torch.zeros(2, 4, vocab)
+    table[0, 1, 40] = 1.0                                       # type A loves gene 40 at t1
+    table[1, 1, 41] = 1.0                                       # type B loves gene 41 at t1
+    common = dict(
+        jepa_encoder='cell', n_queries=8, pred_tps=[1], n_total_tps=3,
+        tokenid_to_rowid_path=str(map_path), output_dir=str(tmp_path / 'out'),
+        tgt_vocab_size=60, d_model=32, num_heads=4, num_layers=1, d_ff=64,
+        max_seq_length=64, seed=0, cell_pool='cls', query_sampling='source_blind',
+        lambda_absent=0.5, nonsrc_weight_power=1.0, nonsrc_weight_floor=0.0,
+    )
+    src = GeneQueryJEPATrainer(
+        nonsrc_celltypes=['A', 'B'], nonsrc_gene_freq=table, **common
+    )
+    state = src.state_dict()
+    assert 'nonsrc_gene_freq' in state
+    assert 'nonsrc_gene_freq' not in src.hparams
+
+    # A fresh trainer (as load_from_checkpoint builds it) gets the table back.
+    fresh = GeneQueryJEPATrainer(nonsrc_celltypes=['A', 'B'], **common)
+    assert fresh.nonsrc_gene_freq is None
+    fresh.on_load_checkpoint({'state_dict': state})
+    fresh.load_state_dict(state)
+    assert torch.equal(fresh.nonsrc_gene_freq, table)
+
+    batch = {'cell_type_harmonized_t1': ['A', 'B', 'unknown']}
+    weights = fresh._nonsrc_weights_for_batch(batch, time_step=1, batch_size=3)
+    assert weights.shape == (3, vocab)
+    assert weights[0, 40] == 1.0 and weights[0, 41] == 0.0
+    assert weights[1, 41] == 1.0 and weights[1, 40] == 0.0
+    # Unknown cell type -> mean over the table rows.
+    assert torch.isclose(weights[2, 40], torch.tensor(0.5))
+    # No cell types in the batch -> mean row for everyone.
+    weights = fresh._nonsrc_weights_for_batch({}, time_step=1, batch_size=2)
+    assert torch.isclose(weights[1, 41], torch.tensor(0.5))
+    # Legacy sampler never weights.
+    legacy = GeneQueryJEPATrainer(**{**common, 'query_sampling': 'target'})
+    assert legacy._nonsrc_weights_for_batch(batch, 1, 3) is None

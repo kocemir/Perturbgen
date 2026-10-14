@@ -1,13 +1,25 @@
-# Registry for KO_comparison.ipynb.
+# Registry for KO_comparison.ipynb and panel_i_pathway_mirror.py.
 # IL1B knockout at 90m LPS, predict 6h / 10h (pred_tps [1, 2]).
 #
-# MaskGIT: 90m-retrained PerturbGen stack.
-# JEPA: 90m 100ep + 200ep CountHead, four settings with --ko-resync-quiz.
-# Focus cell types: NKT, NK, CD8+ T cells (gamma-delta absent from dumps).
+# Active comparison: MaskGIT mask, source_blind mask (20261001),
+# and qsb64+tc48 JEPA with the 25ep pooled count head (20261013).
+# Legacy pad/copytgt YAMLs were removed in the 2026-10-14 cleanup.
+#
+# Main KO tables use CD14 monocytes (IL1B-high). Lymphoid types below
+# are only for the optional cytokine-panel / boxplot note.
+#
+# PATHS ARE MACHINE-SPECIFIC. `maps` and `output_dir` below, and every path
+# inside each experiment's own YAML (`data`, `trainer.output_dir`,
+# `model.*_ckpt`, `cli.args`), are absolute paths into this run's sod2
+# storage -- unlike notebooks 02-08, these are not regenerated from a Python
+# config cell (the registry spans 9 YAMLs with duplicated path fields, incl.
+# inside `cli.args`; templating all of them was judged out of scope for this
+# pass). On a new machine, update `maps`/`output_dir` here and the matching
+# fields in each `configs/ko/*.yaml` this registry points to.
 
 gene_ensembl: ENSG00000125538
 gene_symbol: IL1B
-focus_cell_type: NK
+focus_cell_type: CD14 monocytes
 times:
 - 6h_LPS
 - 10h_LPS
@@ -23,24 +35,17 @@ cytokine_markers:
 maps:
   token_id_to_ensembl: /mnt/sod2-project/csb4/stuke1/perturbgen_reproduction/lps/tokenized_data/lps_90min_perturb/token_id_to_genename_2000_hvg.pkl
   symbol_to_ensembl: /mnt/sod2-project/csb4/stuke1/Geneformer/geneformer/gene_name_id_dict.pkl
-output_dir: /home/stuke1/perturbgen/Perturbgen/docs/examples/ko_comparison_res_90m_jepa100_qresync
+output_dir: /home/stuke1/perturbgen/Perturbgen/docs/examples/ko_comparison_res_maskgit_vs_sourceblind
 reference: maskgit
-pairs:
-- - jepa_srconly_pad
-  - jepa_srconly_mask
-- - jepa_copytgt_pad
-  - jepa_copytgt_mask
+pairs: []
 experiments:
   maskgit:
     yaml: maskgit_il1b_src_90m.yaml
-  jepa_srconly_pad:
-    yaml: jepa_count_il1b_src_90m_srconly_pad.yaml
-  jepa_copytgt_pad:
-    yaml: jepa_count_il1b_src_90m_copytgt_pad.yaml
-  jepa_srconly_mask:
-    yaml: jepa_count_il1b_src_90m_srconly_mask.yaml
-  jepa_copytgt_mask:
-    yaml: jepa_count_il1b_src_90m_copytgt_mask.yaml
+  jepa_sourceblind_srconly_mask:
+    yaml: jepa_count_il1b_src_90m_sourceblind_srconly_mask.yaml
+  jepa_qsb64_tc48_count25_mask:
+    yaml: jepa_count_il1b_src_90m_qsb64_tc48_count25_mask.yaml
+archived_experiments: {}
 focus_cell_types:
 - NKT
 - NK

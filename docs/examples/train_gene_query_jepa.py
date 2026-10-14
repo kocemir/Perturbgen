@@ -49,6 +49,7 @@ import argparse
 import csv
 import json
 import pickle
+import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -243,6 +244,58 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help='add learnable source-rank PE to every gene query '
         '(last slot = gene absent from source)',
+    )
+    model.add_argument(
+        '--query-sampling',
+        choices=('source_blind', 'target'),
+        default='source_blind',
+        help='source_blind (default): pick queries from the source side without '
+        'looking at the target, label afterwards (present / absent). '
+        'target: legacy shared / target-only / decoy pools from the target list.',
+    )
+    model.add_argument(
+        '--n-src-queries',
+        type=int,
+        default=None,
+        help='source_blind: queries drawn from the source cell; the rest come from '
+        'genes the source does not express. Default round(0.75 * n_queries).',
+    )
+    model.add_argument(
+        '--n-top-common-queries',
+        type=int,
+        default=None,
+        help='source_blind: of the non-source queries, how many are the '
+        'deterministic top-K by P(gene in target | cell type, time) (likely '
+        'present, distinct from source) rather than a weighted random draw. '
+        'Default 0 (= old single-pool random draw).',
+    )
+    model.add_argument(
+        '--lambda-absent',
+        type=float,
+        default=0.25,
+        help='weight of the absent-query loss (distance of z_hat to the fixed null). '
+        'Absent slots outnumber present ones (~52%% vs ~48%%), so 0.25 keeps the '
+        'null from dominating early training. 0 reproduces the old objective.',
+    )
+    model.add_argument(
+        '--nonsrc-weighting',
+        choices=('celltype_time', 'time', 'uniform'),
+        default='celltype_time',
+        help='source_blind: how to draw the non-source queries. celltype_time = '
+        'weight gene g by P(g in target | cell type, time)^power + floor '
+        '(train cells only); time = same without cell type; uniform = flat.',
+    )
+    model.add_argument(
+        '--nonsrc-weight-power',
+        type=float,
+        default=0.5,
+        help='exponent applied to the target frequency (0.5 = sqrt smoothing)',
+    )
+    model.add_argument(
+        '--nonsrc-weight-floor',
+        type=float,
+        default=0.02,
+        help='added to every weight so never-seen genes still get asked',
     )
     model.add_argument('--ema-decay', type=float, default=0.996)
     model.add_argument('--lr', type=float, default=1e-4)
@@ -475,6 +528,15 @@ def apply_mode_defaults(args: argparse.Namespace) -> argparse.Namespace:
         raise SystemExit('--cell-pool cls requires --strip-tgt-special-tokens false')
     if args.freeze_encoder_epochs < 0:
         raise SystemExit('--freeze-encoder-epochs must be >= 0')
+    if args.n_src_queries is not None and not 0 <= args.n_src_queries <= args.n_queries:
+        raise SystemExit('--n-src-queries must be within [0, --n-queries]')
+    if args.lambda_absent < 0:
+        raise SystemExit('--lambda-absent must be >= 0')
+    if args.nonsrc_weight_floor < 0 or args.nonsrc_weight_power < 0:
+        raise SystemExit('--nonsrc-weight-floor / --nonsrc-weight-power must be >= 0')
+    if args.query_sampling == 'target' and args.nonsrc_weighting != 'uniform':
+        # The legacy sampler never uses the table; do not spend time building it.
+        args.nonsrc_weighting = 'uniform'
     return args
 
 
@@ -520,6 +582,20 @@ def spec_run_name(args: argparse.Namespace, stamp: str) -> str:
         name += f'_mce{args.lambda_mask_ce:g}_ms{args.mask_frac_of_shared:g}'
     if args.query_src_pos:
         name += '_qsrcpos'
+    if args.query_sampling == 'source_blind':
+        n_src = (
+            args.n_src_queries
+            if args.n_src_queries is not None
+            else int(round(0.75 * args.n_queries))
+        )
+        weighting = {'celltype_time': 'ct', 'time': 't', 'uniform': 'u'}[
+            args.nonsrc_weighting
+        ]
+        name += f'_qsb{n_src}_nw{weighting}'
+        if args.n_top_common_queries:
+            name += f'_tc{args.n_top_common_queries}'
+    if args.lambda_absent > 0:
+        name += f'_la{args.lambda_absent:g}'
     if args.dump_raw_latents:
         name += '_rawdump'
     if args.train_count_decoder:
@@ -610,6 +686,21 @@ def build_specs(
             'frac_shared': args.frac_shared,
             'frac_tgt_only': args.frac_tgt_only,
             'absent_queries': True,
+            'query_sampling': args.query_sampling,
+            'n_src_queries': (
+                args.n_src_queries
+                if args.n_src_queries is not None
+                else int(round(0.75 * args.n_queries))
+            ) if args.query_sampling == 'source_blind' else None,
+            'n_top_common_queries': (
+                args.n_top_common_queries
+                if args.query_sampling == 'source_blind' else None
+            ),
+            'lambda_absent': args.lambda_absent,
+            'nonsrc_weighting': args.nonsrc_weighting,
+            'nonsrc_weight_power': args.nonsrc_weight_power,
+            'nonsrc_weight_floor': args.nonsrc_weight_floor,
+            'absent_target': 'frozen random buffer, norm sqrt(d_model)',
             'query_time': 'learned_embedding',
             'lambda_gene': args.lambda_gene,
             'lambda_cell': args.lambda_cell,
@@ -743,6 +834,129 @@ def select_indices(
     return all_i, None, all_i, False
 
 
+def compute_nonsrc_gene_freq(
+    tgt_datasets: Dict[str, Any],
+    pred_tps: Sequence[int],
+    n_total_tps: int,
+    train_indices: Sequence[int],
+    n_local_vocab: int,
+    weighting: str,
+    class_key: str = 'cell_type_harmonized',
+    max_len: Optional[int] = 512,
+    chunk_size: int = 4096,
+):
+    """P(gene in target | cell type, time) over TRAIN cells, LOCAL id space.
+
+    Returns ``(table, celltypes)`` with ``table`` shaped
+    ``(n_celltypes, n_total_tps + 1, n_local_vocab)`` (row 0 of the time axis
+    is unused). ``weighting='time'`` pools all cell types into one row named
+    ``'ALL'``; ``'uniform'`` returns ``(None, [])``. Only marginal frequencies
+    are used, never a cell's own target, so this cannot leak labels.
+    """
+    import numpy as np
+    import torch
+
+    if weighting == 'uniform':
+        return None, []
+    if weighting not in ('celltype_time', 'time'):
+        raise ValueError(f'unknown nonsrc weighting {weighting!r}')
+    train_indices = [int(i) for i in train_indices]
+    first = tgt_datasets[f'tgt_dataset_t{pred_tps[0]}']
+    if weighting == 'celltype_time':
+        column = first[class_key]
+        celltypes = sorted({str(column[i]) for i in train_indices})
+    else:
+        celltypes = ['ALL']
+    index = {name: i for i, name in enumerate(celltypes)}
+    counts = np.zeros((len(celltypes), n_total_tps + 1, n_local_vocab), dtype=np.float64)
+    n_cells = np.zeros((len(celltypes), n_total_tps + 1), dtype=np.float64)
+    started = time.time()
+    for t in pred_tps:
+        subset = tgt_datasets[f'tgt_dataset_t{t}'].select(train_indices)
+        for chunk in subset.iter(batch_size=chunk_size):
+            ids_rows = chunk['input_ids']
+            names = chunk[class_key] if weighting == 'celltype_time' else None
+            for row_i, ids in enumerate(ids_rows):
+                ct = index[str(names[row_i])] if names is not None else 0
+                arr = np.asarray(ids[:max_len] if max_len else ids)
+                genes = np.unique(arr[arr >= 4])
+                genes = genes[genes < n_local_vocab]
+                counts[ct, t, genes] += 1.0
+                n_cells[ct, t] += 1.0
+    freq = counts / np.clip(n_cells, 1.0, None)[:, :, None]
+    table = torch.tensor(freq, dtype=torch.float32)
+    print(
+        f'non-source query weights: {weighting}, {len(celltypes)} cell-type rows, '
+        f'{len(train_indices)} train cells, tps {list(pred_tps)}, '
+        f'built in {time.time() - started:.1f}s'
+    )
+    for t in pred_tps:
+        mean_present = float(table[:, t].sum(-1).mean())
+        print(f'  t{t}: mean genes present per cell (by cell type) = {mean_present:.0f}')
+    return table, celltypes
+
+
+def print_quiz_preview(
+    model,
+    src_dataset,
+    tgt_datasets: Dict[str, Any],
+    train_indices: Sequence[int],
+    pred_tps: Sequence[int],
+    max_len: Optional[int],
+    class_key: str = 'cell_type_harmonized',
+    n_cells: int = 256,
+) -> Dict[str, float]:
+    """Pre-training check of the quiz statistics on a few train cells.
+
+    Prints P(present | src_pos = -1), P(present | src_pos >= 0), the absent
+    fraction and how many non-source queries turn out present. With the
+    target sampler the first two are ~0.82 / 1.00 (the PE leaks the answer);
+    source_blind should land near the data's own rates (~0.07 / ~0.62).
+    """
+    import torch
+
+    def pad_rows(id_rows) -> torch.Tensor:
+        seqs = [list(r[:max_len]) if max_len else list(r) for r in id_rows]
+        out = torch.zeros(len(seqs), max(len(s) for s in seqs), dtype=torch.long)
+        for i, s in enumerate(seqs):
+            out[i, : len(s)] = torch.tensor(s, dtype=torch.long)
+        return out
+
+    rows = [int(i) for i in list(train_indices)[:n_cells]]
+    if not rows:
+        return {}
+    src_rows = src_dataset.select(rows)
+    src = pad_rows(src_rows['input_ids'])
+    summary: Dict[str, float] = {}
+    print('\nQuiz preview (train cells, before any training):')
+    for t in pred_tps:
+        tgt_rows = tgt_datasets[f'tgt_dataset_t{t}'].select(rows)
+        batch = {
+            'src_input_ids': src,
+            f'tgt_input_ids_t{t}': pad_rows(tgt_rows['input_ids']),
+        }
+        if class_key in tgt_rows.column_names:
+            batch[f'{class_key}_t{t}'] = [str(x) for x in tgt_rows[class_key]]
+        quiz = model._sample_quiz(batch, t, src, mask_frac=0.0)
+        valid = quiz['is_valid']
+        present = quiz['is_present'] & valid
+        neg = valid & (quiz['src_position'] < 0)
+        pos = valid & (quiz['src_position'] >= 0)
+        p_neg = float(present[neg].float().mean()) if neg.any() else float('nan')
+        p_pos = float(present[pos].float().mean()) if pos.any() else float('nan')
+        absent_frac = float((~present & valid).float().sum() / valid.float().sum())
+        induced = float((present & neg).float().sum(1).mean())
+        summary[f't{t}/p_present_neg'] = p_neg
+        summary[f't{t}/p_present_pos'] = p_pos
+        summary[f't{t}/absent_frac'] = absent_frac
+        print(
+            f'  t{t}: P(present | -1)={p_neg:.3f}  P(present | >=0)={p_pos:.3f}  '
+            f'absent={absent_frac:.1%}  non-source-but-present per cell={induced:.1f}  '
+            f'filler slots={int((~valid).sum())}'
+        )
+    return summary
+
+
 def gap_key(has_val: bool) -> str:
     return f'{"val" if has_val else "train"}/{GAP}'
 
@@ -756,15 +970,17 @@ def print_metrics_table(metrics_csv_path: str, has_val: bool) -> float:
     columns = [
         (f'{prefix}/total_loss', 'total'),
         (f'{prefix}/gene_loss', 'gene_loss'),
+        (f'{prefix}/absent_loss', 'absent'),
         (f'{prefix}/mask_ce_loss', 'mask_ce'),
         (f'{prefix}/contrastive_loss', 'contr'),
         (f'{prefix}/gene_mse', 'gene_mse'),
         (f'{prefix}/gene_cos_pred', 'cos_pred'),
         (gap_col, 'gap_copy'),
         (f'{prefix}/gene_gap_vs_static', 'gap_static'),
+        (f'{prefix}/absent_cos_null', 'abs_cos0'),
+        (f'{prefix}/present_cos_null', 'pres_cos0'),
+        (f'{prefix}/quiz_p_present_neg', 'p_pres|-1'),
         (f'{prefix}/cell_loss', 'cell_loss'),
-        (f'{prefix}/vicreg_var', 'vic_var'),
-        (f'{prefix}/vicreg_cov', 'vic_cov'),
     ]
     header = 'epoch  ' + '  '.join(f'{short:>10}' for _, short in columns)
     print('\n' + header)
@@ -1085,14 +1301,23 @@ def print_verdict(args: argparse.Namespace, last_gap: float, metrics_path: str) 
     print(f'(table: {metrics_path})')
 
 
-def load_tgt_counts(tokenized: str) -> Dict[str, Any]:
+def load_tgt_counts(tokenized: str) -> Tuple[Dict[str, Any], List[str]]:
     from perturbgen.src.utils import read_dataset_files
 
     folder = f'{tokenized}/h5ad_pairing_2000_hvg_tgt'
     if not Path(folder).is_dir():
         raise SystemExit(f'count h5ads not found: {folder}')
     tgt_adatas = read_dataset_files(folder, 'h5ad')
-    return {key: adata.X for key, adata in tgt_adatas.items()}
+    panels = {key: list(a.var_names.astype(str)) for key, a in tgt_adatas.items()}
+    gene_panel = next(iter(panels.values()))
+    for key, other in panels.items():
+        if other != gene_panel:
+            raise SystemExit(
+                f'{key} has a different gene panel/order than the rest of '
+                f'{folder} -- tgt_counts_t{{t}} columns must line up '
+                'across timepoints for a single count decoder to score them.'
+            )
+    return {key: adata.X for key, adata in tgt_adatas.items()}, gene_panel
 
 
 def run_count_train(args: argparse.Namespace) -> None:
@@ -1116,7 +1341,7 @@ def run_count_train(args: argparse.Namespace) -> None:
     print('Loading tokenised datasets + count h5ads...')
     src_dataset = load_from_disk(resolve_src_dataset_path(args.tokenized))
     tgt_datasets = read_dataset_files(f'{args.tokenized}/dataset_2000_hvg_tgt', 'dataset')
-    tgt_counts_dict = load_tgt_counts(args.tokenized)
+    tgt_counts_dict, gene_panel = load_tgt_counts(args.tokenized)
     train_i, val_i, test_i, use_split = select_indices(args, src_dataset)
     has_val = val_i is not None
     monitor = 'val/mse' if has_val else 'train/mse'
@@ -1159,10 +1384,19 @@ def run_count_train(args: argparse.Namespace) -> None:
         seed=args.seed,
         strip_tgt_special_tokens=args.strip_tgt_special_tokens,
         max_len=args.max_len,
+        # source_only quiz reuses the JEPA sampler; cell types feed its weights.
+        var_list=['cell_type_harmonized'],
     )
+    if len(gene_panel) != args.n_genes:
+        print(
+            f'--n-genes {args.n_genes} != {len(gene_panel)} genes found in '
+            f'{args.tokenized}/h5ad_pairing_2000_hvg_tgt; using the latter.'
+        )
     model = GeneQueryCountDecoderTrainer(
         jepa_ckpt=args.jepa_ckpt,
-        n_genes=args.n_genes,
+        gene_panel_ensembl=gene_panel,
+        vocab_path=f'{args.tokenized}/token_id_to_genename_2000_hvg.pkl',
+        n_genes=len(gene_panel),
         lr=args.lr,
         weight_decay=args.weight_decay,
         dropout=args.count_dropout,
@@ -1310,7 +1544,8 @@ def run_count_ko(args: argparse.Namespace) -> None:
     src_dataset = load_from_disk(str(src_path))
     tgt_datasets = read_dataset_files(f'{tokenized}/dataset_2000_hvg_tgt', 'dataset')
     tgt_adatas = read_dataset_files(h5ad_dir, 'h5ad')
-    n_genes = int(next(iter(tgt_adatas.values())).shape[1])
+    gene_panel = list(next(iter(tgt_adatas.values())).var_names.astype(str))
+    n_genes = len(gene_panel)
     tgt_counts_dict = {key: adata.X for key, adata in tgt_adatas.items()}
     n_cells = len(src_dataset)
     data_module = PerturbGenDataModule(
@@ -1339,6 +1574,8 @@ def run_count_ko(args: argparse.Namespace) -> None:
         str(args.count_ckpt),
         map_location='cpu',
         jepa_ckpt=str(args.jepa_ckpt),
+        gene_panel_ensembl=gene_panel,
+        vocab_path=f'{tokenized}/token_id_to_genename_2000_hvg.pkl',
         n_genes=n_genes,
         pred_tps=pred_tps,
         output_dir=args.output_dir,
@@ -1474,6 +1711,37 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     specs_path = write_specs(run_dir, specs)
     print(f'Wrote {specs_path}')
 
+    # source_blind: marginal target frequencies per (cell type, time) steer
+    # which non-source genes get asked. Train cells only; saved next to the
+    # run and inside the checkpoint (trainer buffer) for eval / KO reuse.
+    tokenid_to_rowid_path = f'{args.tokenized}/tokenid_to_rowid_2000_hvg.pkl'
+    nonsrc_table, nonsrc_celltypes = None, []
+    if args.query_sampling == 'source_blind' and args.nonsrc_weighting != 'uniform':
+        from perturbgen.src.jepa_token_maps import maybe_load_maps
+
+        _, local_to_global = maybe_load_maps(tokenid_to_rowid_path)
+        nonsrc_table, nonsrc_celltypes = compute_nonsrc_gene_freq(
+            tgt_datasets,
+            pred_tps=args.pred_tps,
+            n_total_tps=args.n_total_tps,
+            train_indices=train_i,
+            n_local_vocab=int(local_to_global.numel()),
+            weighting=args.nonsrc_weighting,
+            class_key='cell_type_harmonized',
+            max_len=args.max_len,
+        )
+        import torch
+
+        torch.save(
+            {
+                'freq': nonsrc_table,
+                'celltypes': nonsrc_celltypes,
+                'pred_tps': list(args.pred_tps),
+                'weighting': args.nonsrc_weighting,
+            },
+            run_dir / 'nonsrc_gene_freq.pt',
+        )
+
     data_module = PerturbGenDataModule(
         src_dataset=src_dataset,
         tgt_datasets=tgt_datasets,
@@ -1490,6 +1758,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         seed=args.seed,
         strip_tgt_special_tokens=args.strip_tgt_special_tokens,
         max_len=args.max_len,
+        # Cell-type strings ride along so the sampler can look up its weights.
+        var_list=['cell_type_harmonized'] if nonsrc_table is not None else None,
     )
 
     model = GeneQueryJEPATrainer(
@@ -1523,12 +1793,29 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         normalize_latents=args.normalize_latents,
         pred_tps=args.pred_tps,
         n_total_tps=args.n_total_tps,
-        tokenid_to_rowid_path=f'{args.tokenized}/tokenid_to_rowid_2000_hvg.pkl',
+        tokenid_to_rowid_path=tokenid_to_rowid_path,
         output_dir=args.output_dir,
         seed=args.seed,
         cell_pool=args.cell_pool,
         max_seq_length=args.max_len,
+        query_sampling=args.query_sampling,
+        n_src_queries=args.n_src_queries,
+        n_top_common_queries=args.n_top_common_queries,
+        lambda_absent=args.lambda_absent,
+        nonsrc_weight_power=args.nonsrc_weight_power,
+        nonsrc_weight_floor=args.nonsrc_weight_floor,
+        nonsrc_celltypes=nonsrc_celltypes,
+        nonsrc_gene_freq=nonsrc_table,
     )
+    specs['quiz_preview'] = print_quiz_preview(
+        model,
+        src_dataset,
+        tgt_datasets,
+        train_indices=train_i,
+        pred_tps=args.pred_tps,
+        max_len=args.max_len,
+    )
+    write_specs(run_dir, specs)
     print(
         'Run config: '
         f'data={args.data}, freeze_encoder={args.freeze_encoder}, '
@@ -1547,6 +1834,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         f'lambda_mask_ce={args.lambda_mask_ce}, '
         f'mask_frac_of_shared={args.mask_frac_of_shared}, '
         f'query_src_pos={args.query_src_pos}, '
+        f'query_sampling={args.query_sampling}, '
+        f'n_src_queries={model.n_src_queries}, '
+        f'n_top_common_queries={model.n_top_common_queries}, '
+        f'lambda_absent={args.lambda_absent}, '
+        f'nonsrc_weighting={args.nonsrc_weighting}, '
         f'dump_raw={args.dump_raw_latents}, '
         f'vicreg_var={args.vicreg_var}, vicreg_cov={args.vicreg_cov}, '
         f'epochs={args.epochs}, output_dir={args.output_dir}, '

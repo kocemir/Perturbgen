@@ -10,19 +10,34 @@ WHAT HAPPENS EVERY TRAINING STEP (plain language)
 1. The dataloader hands us a batch: source cells (normal / resting tokens)
    and their pseudo-paired target cells at each later timepoint (t1, t2, t3).
 2. For every cell and timepoint we SAMPLE GENE QUERIES — a quiz sheet of
-   ``n_queries`` genes per cell (three parts):
-      ~40%  genes present in BOTH source and target   (shared — shift)
-      ~50%  genes present ONLY in the target           (induced)
-      ~10%  genes absent from the target               (placeholder pad; no loss)
+   ``n_queries`` genes per cell. Two samplers (``query_sampling``):
+   * 'source_blind' (new runs): pick ``n_src_queries`` from the genes the
+     SOURCE cell expresses; split the rest between ``n_top_common_queries``
+     genes the source does NOT express, chosen deterministically by highest
+     P(gene in target | cell type, time) (likely present, still never looks
+     at THIS cell's target), and a random remainder drawn with weights
+     biased toward LOW P(gene in target | cell type, time) (likely absent,
+     but resampled every call so no fixed gene id is ever memorised). Only
+     then read the label off the target: present (true H_tgt row) or absent
+     (fixed null vector). ``src_position`` is always the real source rank
+     (or -1 = not in source), so the rank PE describes the source only and
+     cannot leak the target. ``n_top_common_queries`` defaults to 0, which
+     reproduces the original single-pool random draw exactly.
+   * 'target' (legacy): ~40% shared / ~50% target-only / ~10% absent
+     decoys, all chosen from the target's own gene list. Here every query
+     with src_position >= 0 is present and 82% of the -1 queries are
+     present, i.e. the PE itself tells the model the answer.
 3. The model predicts each queried gene's embedding at the target time.
    Timepoints are independent (no autoregressive context).
-4. Losses:  gene loss   = 1 - cosine(predicted, true) on PRESENT queries only
+4. Losses:  gene loss   = cosine / MSE (predicted, true) on PRESENT queries
+            absent loss = same distance to the fixed null on ABSENT queries
             cell loss   = 1 - cosine(learned cell-query pred, encoder CLS)
             contrastive = InfoNCE on present queries (anti-collapse; default 0)
             VICReg      = var/cov on z_hat_cell only (no gene bag)
             gene MSE    = logged only (train/val), not in the objective
-   total = lambda_gene * gene_loss + lambda_cell * cell_loss
-           + lambda_contr * contrastive + vic_var * var + vic_cov * cov
+   total = lambda_gene * gene_loss + lambda_absent * absent_loss
+           + lambda_cell * cell_loss + lambda_contr * contrastive
+           + vic_var * var + vic_cov * cov
 5. After the optimiser step, the EMA target encoder drifts a tiny step
    towards the online encoder.
 
@@ -79,6 +94,47 @@ SRC_MASK_TOKEN_ID = 1
 # The query sampler. Plain Python on purpose: per cell we do set operations
 # on ~100-2000 gene ids, which costs well under a millisecond per cell.
 # ==========================================================================
+QUERY_SAMPLING_MODES = ('source_blind', 'target')
+
+
+def _first_gene_positions(
+    row: List[int],
+    to_local: Optional[List[int]] = None,
+) -> Dict[int, int]:
+    """First index of every real LOCAL gene id in one token row.
+
+    ``to_local`` converts GLOBAL source tokens; out-of-range tokens map to 0
+    (pad) and are ignored like every other special id (< 4).
+    """
+    positions: Dict[int, int] = {}
+    for position, token in enumerate(row):
+        if to_local is not None:
+            local_id = to_local[token] if 0 <= token < len(to_local) else 0
+        else:
+            local_id = token
+        if local_id >= FIRST_REAL_GENE_LOCAL_ID and local_id not in positions:
+            positions[local_id] = position
+    return positions
+
+
+def _quiz_tensors(
+    gene_ids: List[List[int]],
+    is_present: List[List[bool]],
+    tgt_position: List[List[int]],
+    src_position: List[List[int]],
+    is_mask_ce: List[List[bool]],
+    is_valid: List[List[bool]],
+) -> Dict[str, torch.Tensor]:
+    return {
+        'gene_ids_local': torch.tensor(gene_ids, dtype=torch.long),
+        'is_present': torch.tensor(is_present, dtype=torch.bool),
+        'tgt_position': torch.tensor(tgt_position, dtype=torch.long),
+        'src_position': torch.tensor(src_position, dtype=torch.long),
+        'is_mask_ce': torch.tensor(is_mask_ce, dtype=torch.bool),
+        'is_valid': torch.tensor(is_valid, dtype=torch.bool),
+    }
+
+
 def sample_query_batch(
     src_input_ids_global: torch.Tensor,   # (B, Ls) source tokens, GLOBAL ids
     tgt_input_ids_local: torch.Tensor,    # (B, Lt) target tokens, LOCAL ids
@@ -91,46 +147,239 @@ def sample_query_batch(
     query_mode: str = 'mixed',
     shared_max_queries: int = 0,
     mask_frac_of_shared: float = 0.0,
+    query_sampling: str = 'target',
+    n_src_queries: Optional[int] = None,
+    nonsrc_weights: Optional[torch.Tensor] = None,
+    n_top_common_queries: int = 0,
+    lowfreq_weights: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the per-cell quiz sheet. Returns CPU tensors, all shaped (B, Q).
 
-    Three pools: shared (~40%), target-only (~50%), absent placeholders (rest).
+    ``query_sampling='source_blind'``: ``n_src_queries`` genes drawn from the
+    source cell (uniform) + the rest from genes the source does not express.
+    That remainder is itself two pools: the top ``n_top_common_queries`` by
+    ``nonsrc_weights`` (deterministic, per cell -- "likely present"), then a
+    random draw of whatever is left, weighted by ``lowfreq_weights`` if given
+    (falls back to ``nonsrc_weights``, then uniform). ``n_top_common_queries``
+    defaults to 0, reproducing the original one-pool random draw exactly.
+    The target is consulted only for the labels. ``mask_frac_of_shared`` then
+    applies to the chosen source genes.
+
+    ``query_sampling='target'`` (legacy): shared (~40%), target-only (~50%),
+    absent decoys (rest), all picked from the target's gene list.
+
+    Both return ``is_valid``: False only for filler slots added when the
+    pools run dry (tiny vocabularies); those must stay out of every loss.
+    ``src_position`` is always the real source rank, -1 = not in source.
     query_mode / shared_max_queries are accepted for old CLI flags and ignored.
-    ``mask_frac_of_shared`` marks that fraction of *chosen shared* slots for
-    mask-CE (no gene identity). Default 0 keeps the old quiz.
     """
     del query_mode, shared_max_queries
-    batch_size = tgt_input_ids_local.size(0)
-
+    if query_sampling not in QUERY_SAMPLING_MODES:
+        raise ValueError(
+            f'query_sampling must be one of {QUERY_SAMPLING_MODES}, '
+            f'got {query_sampling!r}'
+        )
     src_rows = src_input_ids_global.detach().cpu().tolist()
     tgt_rows = tgt_input_ids_local.detach().cpu().tolist()
     global_to_local_list = global_to_local.detach().cpu().tolist()
-
-    all_genes_set = set(all_gene_local_ids)
-    n_shared_wanted = round(frac_shared * n_queries)
-    n_tgt_only_wanted = round(frac_tgt_only * n_queries)
     mask_frac = max(0.0, float(mask_frac_of_shared))
+    if query_sampling == 'source_blind':
+        if n_src_queries is None:
+            n_src_queries = int(round(0.75 * n_queries))
+        return _sample_source_blind(
+            src_rows=src_rows,
+            tgt_rows=tgt_rows,
+            global_to_local_list=global_to_local_list,
+            all_gene_local_ids=all_gene_local_ids,
+            n_queries=n_queries,
+            n_src_queries=int(n_src_queries),
+            mask_frac=mask_frac,
+            rng=rng,
+            nonsrc_weights=nonsrc_weights,
+            n_top_common_queries=int(n_top_common_queries),
+            lowfreq_weights=lowfreq_weights,
+        )
+    return _sample_target_quiz(
+        src_rows=src_rows,
+        tgt_rows=tgt_rows,
+        global_to_local_list=global_to_local_list,
+        all_gene_local_ids=all_gene_local_ids,
+        n_queries=n_queries,
+        frac_shared=frac_shared,
+        frac_tgt_only=frac_tgt_only,
+        mask_frac=mask_frac,
+        rng=rng,
+    )
+
+
+def _sample_source_blind(
+    src_rows: List[List[int]],
+    tgt_rows: List[List[int]],
+    global_to_local_list: List[int],
+    all_gene_local_ids: List[int],
+    n_queries: int,
+    n_src_queries: int,
+    mask_frac: float,
+    rng: random.Random,
+    nonsrc_weights: Optional[torch.Tensor],
+    n_top_common_queries: int = 0,
+    lowfreq_weights: Optional[torch.Tensor] = None,
+) -> Dict[str, torch.Tensor]:
+    """Target-blind quiz: choose genes from the source side, label afterwards."""
+    if not 0 <= n_src_queries <= n_queries:
+        raise ValueError(
+            f'n_src_queries must be in [0, n_queries={n_queries}], got {n_src_queries}'
+        )
+    if n_top_common_queries < 0 or n_top_common_queries > n_queries - n_src_queries:
+        raise ValueError(
+            f'n_top_common_queries must be in [0, n_queries - n_src_queries='
+            f'{n_queries - n_src_queries}], got {n_top_common_queries}'
+        )
+    universe = torch.tensor(sorted(all_gene_local_ids), dtype=torch.long)
+
+    def _validate_weights(weights: torch.Tensor, name: str) -> torch.Tensor:
+        weights = weights.detach().cpu().float()
+        if weights.dim() not in (1, 2):
+            raise ValueError(f'{name} must be (V,) or (B, V)')
+        if weights.size(-1) <= int(universe.max()):
+            raise ValueError(
+                f'{name} covers {weights.size(-1)} LOCAL ids, '
+                f'need > {int(universe.max())}'
+            )
+        return weights
+
+    if nonsrc_weights is not None:
+        nonsrc_weights = _validate_weights(nonsrc_weights, 'nonsrc_weights')
+    if lowfreq_weights is not None:
+        lowfreq_weights = _validate_weights(lowfreq_weights, 'lowfreq_weights')
+    generator = None
+    if nonsrc_weights is not None or lowfreq_weights is not None:
+        # One torch stream per call, seeded from the Python rng so DDP ranks
+        # and resumed runs stay reproducible through the same seed.
+        generator = torch.Generator().manual_seed(rng.getrandbits(62))
+    fill_gene = all_gene_local_ids[0]
 
     out_gene_ids: List[List[int]] = []
     out_is_present: List[List[bool]] = []
     out_tgt_position: List[List[int]] = []
     out_src_position: List[List[int]] = []
     out_is_mask_ce: List[List[bool]] = []
+    out_is_valid: List[List[bool]] = []
 
-    for cell in range(batch_size):
-        tgt_gene_position: Dict[int, int] = {}
-        for position, token in enumerate(tgt_rows[cell]):
-            if token >= FIRST_REAL_GENE_LOCAL_ID and token not in tgt_gene_position:
-                tgt_gene_position[token] = position
+    for cell in range(len(src_rows)):
+        src_gene_position = _first_gene_positions(src_rows[cell], global_to_local_list)
+        tgt_gene_position = _first_gene_positions(tgt_rows[cell])
 
-        src_gene_position: Dict[int, int] = {}
-        for position, token in enumerate(src_rows[cell]):
-            if 0 <= token < len(global_to_local_list):
-                local_id = global_to_local_list[token]
-            else:
-                local_id = 0
-            if local_id >= FIRST_REAL_GENE_LOCAL_ID and local_id not in src_gene_position:
-                src_gene_position[local_id] = position
+        # ---- 1) source-side genes: uniform, no look at the target ----------
+        src_genes = list(src_gene_position)
+        take_src = min(n_src_queries, len(src_genes))
+        chosen_src = rng.sample(src_genes, take_src) if take_src else []
+        n_mask = int(round(mask_frac * len(chosen_src))) if mask_frac > 0 else 0
+        n_mask = min(n_mask, len(chosen_src))
+        mask_set = set(rng.sample(chosen_src, n_mask)) if n_mask else set()
+
+        # ---- 2) genes the source does not express (fill the remainder) -----
+        n_non = n_queries - take_src
+        chosen_top: List[int] = []
+        chosen_non: List[int] = []
+        if n_non > 0:
+            in_src = torch.tensor(src_genes, dtype=torch.long)
+            keep = ~torch.isin(universe, in_src) if len(src_genes) else torch.ones(
+                universe.numel(), dtype=torch.bool
+            )
+            non_pool = universe[keep]
+
+            # ---- 2a) deterministic top-K by presence weight: "likely
+            #      present, distinct from source". Off by default (K=0). ----
+            take_top = min(n_top_common_queries, n_non, int(non_pool.numel()))
+            if take_top > 0 and nonsrc_weights is not None:
+                row = nonsrc_weights if nonsrc_weights.dim() == 1 else nonsrc_weights[cell]
+                top_idx = torch.topk(row[non_pool], take_top).indices
+                chosen_top = non_pool[top_idx].tolist()
+                keep_rest = torch.ones(non_pool.numel(), dtype=torch.bool)
+                keep_rest[top_idx] = False
+                non_pool = non_pool[keep_rest]
+
+            # ---- 2b) the rest: random, optionally biased toward absence ----
+            take_non = min(n_non - take_top, int(non_pool.numel()))
+            if take_non > 0:
+                weight_source = lowfreq_weights if lowfreq_weights is not None else nonsrc_weights
+                if weight_source is None:
+                    chosen_non = rng.sample(non_pool.tolist(), take_non)
+                else:
+                    row = (
+                        weight_source if weight_source.dim() == 1 else weight_source[cell]
+                    )
+                    weights = row[non_pool].clamp(min=0.0)
+                    if int((weights > 0).sum()) < take_non:
+                        # Not enough positive mass: everyone gets a floor.
+                        weights = weights + 1e-6
+                    pick = torch.multinomial(
+                        weights, take_non, replacement=False, generator=generator
+                    )
+                    chosen_non = non_pool[pick].tolist()
+
+        # ---- 3) labels come from the target ONLY NOW --------------------------
+        row_gene_ids: List[int] = []
+        row_is_present: List[bool] = []
+        row_tgt_position: List[int] = []
+        row_src_position: List[int] = []
+        row_is_mask_ce: List[bool] = []
+        row_is_valid: List[bool] = []
+        for gene in chosen_src + chosen_top + chosen_non:
+            row_gene_ids.append(gene)
+            row_is_present.append(gene in tgt_gene_position)
+            row_tgt_position.append(tgt_gene_position.get(gene, 0))
+            row_src_position.append(src_gene_position.get(gene, -1))
+            row_is_mask_ce.append(gene in mask_set)
+            row_is_valid.append(True)
+        while len(row_gene_ids) < n_queries:
+            row_gene_ids.append(fill_gene)
+            row_is_present.append(False)
+            row_tgt_position.append(0)
+            row_src_position.append(-1)
+            row_is_mask_ce.append(False)
+            row_is_valid.append(False)
+
+        out_gene_ids.append(row_gene_ids)
+        out_is_present.append(row_is_present)
+        out_tgt_position.append(row_tgt_position)
+        out_src_position.append(row_src_position)
+        out_is_mask_ce.append(row_is_mask_ce)
+        out_is_valid.append(row_is_valid)
+
+    return _quiz_tensors(
+        out_gene_ids, out_is_present, out_tgt_position,
+        out_src_position, out_is_mask_ce, out_is_valid,
+    )
+
+
+def _sample_target_quiz(
+    src_rows: List[List[int]],
+    tgt_rows: List[List[int]],
+    global_to_local_list: List[int],
+    all_gene_local_ids: List[int],
+    n_queries: int,
+    frac_shared: float,
+    frac_tgt_only: float,
+    mask_frac: float,
+    rng: random.Random,
+) -> Dict[str, torch.Tensor]:
+    """Legacy quiz: pools defined by the target's gene list."""
+    all_genes_set = set(all_gene_local_ids)
+    n_shared_wanted = round(frac_shared * n_queries)
+    n_tgt_only_wanted = round(frac_tgt_only * n_queries)
+
+    out_gene_ids: List[List[int]] = []
+    out_is_present: List[List[bool]] = []
+    out_tgt_position: List[List[int]] = []
+    out_src_position: List[List[int]] = []
+    out_is_mask_ce: List[List[bool]] = []
+    out_is_valid: List[List[bool]] = []
+
+    for cell in range(len(src_rows)):
+        tgt_gene_position = _first_gene_positions(tgt_rows[cell])
+        src_gene_position = _first_gene_positions(src_rows[cell], global_to_local_list)
 
         shared_pool = [g for g in tgt_gene_position if g in src_gene_position]
         tgt_only_pool = [g for g in tgt_gene_position if g not in src_gene_position]
@@ -165,38 +414,43 @@ def sample_query_batch(
         row_tgt_position: List[int] = []
         row_src_position: List[int] = []
         row_is_mask_ce: List[bool] = []
+        row_is_valid: List[bool] = []
         for gene in chosen_shared + chosen_tgt_only:
             row_gene_ids.append(gene)
             row_is_present.append(True)
             row_tgt_position.append(tgt_gene_position[gene])
             row_src_position.append(src_gene_position.get(gene, -1))
             row_is_mask_ce.append(gene in mask_shared)
+            row_is_valid.append(True)
         for gene in chosen_absent:
             row_gene_ids.append(gene)
             row_is_present.append(False)
             row_tgt_position.append(0)
-            row_src_position.append(-1)
+            # Real source rank, like every other query: -1 means "not in
+            # source", never "not in target" (the old unconditional -1 made
+            # src_position >= 0 imply present).
+            row_src_position.append(src_gene_position.get(gene, -1))
             row_is_mask_ce.append(False)
+            row_is_valid.append(True)
         while len(row_gene_ids) < n_queries:
             row_gene_ids.append(all_gene_local_ids[0])
             row_is_present.append(False)
             row_tgt_position.append(0)
             row_src_position.append(-1)
             row_is_mask_ce.append(False)
+            row_is_valid.append(False)
 
         out_gene_ids.append(row_gene_ids)
         out_is_present.append(row_is_present)
         out_tgt_position.append(row_tgt_position)
         out_src_position.append(row_src_position)
         out_is_mask_ce.append(row_is_mask_ce)
+        out_is_valid.append(row_is_valid)
 
-    return {
-        'gene_ids_local': torch.tensor(out_gene_ids, dtype=torch.long),
-        'is_present': torch.tensor(out_is_present, dtype=torch.bool),
-        'tgt_position': torch.tensor(out_tgt_position, dtype=torch.long),
-        'src_position': torch.tensor(out_src_position, dtype=torch.long),
-        'is_mask_ce': torch.tensor(out_is_mask_ce, dtype=torch.bool),
-    }
+    return _quiz_tensors(
+        out_gene_ids, out_is_present, out_tgt_position,
+        out_src_position, out_is_mask_ce, out_is_valid,
+    )
 
 
 def apply_src_masks(
@@ -345,6 +599,17 @@ class GeneQueryJEPATrainer(LightningModule):
         use_query_src_pos: bool = True,
         dump_raw_latents: bool = False,
         src_mask_token_id: int = SRC_MASK_TOKEN_ID,
+        # ---- quiz sampler / absent supervision ----
+        # Defaults keep old checkpoints (which store none of these) on the
+        # legacy behaviour; the CLI sets the new values for new runs.
+        query_sampling: str = 'target',
+        n_src_queries: Optional[int] = None,
+        n_top_common_queries: Optional[int] = None,
+        lambda_absent: float = 0.0,
+        nonsrc_weight_power: float = 0.5,
+        nonsrc_weight_floor: float = 0.02,
+        nonsrc_celltypes: Optional[List[str]] = None,
+        nonsrc_gene_freq: Optional[torch.Tensor] = None,
         # ---- optimisation ----
         lr: float = 1e-4,
         encoder_lr: Optional[float] = None,
@@ -371,13 +636,56 @@ class GeneQueryJEPATrainer(LightningModule):
         **unused_cli_kwargs,
     ):
         super().__init__()
-        self.save_hyperparameters()
+        # The frequency table is a tensor -> buffer + checkpoint, not hparams.
+        self.save_hyperparameters(ignore=['nonsrc_gene_freq'])
         self.pred_tps = pred_tps if pred_tps is not None else [1, 2, 3]
         self.n_queries = n_queries
         self.frac_shared = frac_shared
         self.frac_tgt_only = frac_tgt_only
         self.query_mode = query_mode
         self.shared_max_queries = int(shared_max_queries)
+        if query_sampling not in QUERY_SAMPLING_MODES:
+            raise ValueError(
+                f'query_sampling must be one of {QUERY_SAMPLING_MODES}, '
+                f'got {query_sampling!r}'
+            )
+        self.query_sampling = query_sampling
+        if n_src_queries is None and query_sampling == 'source_blind':
+            n_src_queries = int(round(0.75 * n_queries))
+        if n_src_queries is not None and not 0 <= int(n_src_queries) <= n_queries:
+            raise ValueError(
+                f'n_src_queries must be in [0, {n_queries}], got {n_src_queries}'
+            )
+        self.n_src_queries = None if n_src_queries is None else int(n_src_queries)
+        if n_top_common_queries is not None:
+            if self.n_src_queries is None:
+                raise ValueError(
+                    'n_top_common_queries requires n_src_queries to be set'
+                )
+            remaining = n_queries - self.n_src_queries
+            if not 0 <= int(n_top_common_queries) <= remaining:
+                raise ValueError(
+                    f'n_top_common_queries must be in [0, {remaining}] '
+                    f'(= n_queries - n_src_queries), got {n_top_common_queries}'
+                )
+        self.n_top_common_queries = (
+            None if n_top_common_queries is None else int(n_top_common_queries)
+        )
+        if lambda_absent < 0:
+            raise ValueError('lambda_absent must be >= 0')
+        self.lambda_absent = float(lambda_absent)
+        self.nonsrc_weight_power = float(nonsrc_weight_power)
+        self.nonsrc_weight_floor = float(nonsrc_weight_floor)
+        self.nonsrc_celltypes = list(nonsrc_celltypes) if nonsrc_celltypes else []
+        self._celltype_index = {
+            name: index for index, name in enumerate(self.nonsrc_celltypes)
+        }
+        # (n_celltypes, n_total_tps + 1, LOCAL vocab): P(gene in target | cell
+        # type, time). Only used to weight the non-source queries of the
+        # source_blind sampler; never conditioned on the cell's own target.
+        self.register_buffer('nonsrc_gene_freq', None)
+        if nonsrc_gene_freq is not None:
+            self._set_nonsrc_gene_freq(nonsrc_gene_freq)
         self.lambda_gene = lambda_gene
         self.lambda_cell = lambda_cell
         self.lambda_contrastive = float(lambda_contrastive)
@@ -503,7 +811,14 @@ class GeneQueryJEPATrainer(LightningModule):
             f'gene_loss={self.gene_loss_type}, '
             f'lambda_mask_ce={self.lambda_mask_ce}, '
             f'mask_frac_of_shared={self.mask_frac_of_shared}, '
-            f'dump_raw_latents={self.dump_raw_latents}'
+            f'dump_raw_latents={self.dump_raw_latents}, '
+            f'query_sampling={self.query_sampling}, '
+            f'n_src_queries={self.n_src_queries}, '
+            f'n_top_common_queries={self.n_top_common_queries}, '
+            f'lambda_absent={self.lambda_absent}, '
+            f'nonsrc_weights={"celltype x time table" if self.nonsrc_gene_freq is not None else "uniform"}'
+            f'{f" (pow {self.nonsrc_weight_power:g}, floor {self.nonsrc_weight_floor:g})" if self.nonsrc_gene_freq is not None else ""}, '
+            f'absent_null_norm={float(self.model.absent_gene_embedding.norm()):.2f}'
         )
 
         # Random generator for query sampling; re-seeded per DDP rank in setup().
@@ -556,6 +871,27 @@ class GeneQueryJEPATrainer(LightningModule):
                 arch=ckpt_arch,
             )
 
+        # The non-source frequency table only exists in checkpoints of
+        # source_blind runs; give it a home before load_state_dict runs.
+        if 'nonsrc_gene_freq' in saved and self.nonsrc_gene_freq is None:
+            self._set_nonsrc_gene_freq(torch.zeros_like(saved['nonsrc_gene_freq']))
+
+        # The 1 Oct 14:30 (lr 5e-5) run was saved with one extra, never-used
+        # row in the source-rank PE table. Rows 0..n_pos-1 are the same rows
+        # as here (ranks, then "-1 = not in source"), so drop the surplus
+        # instead of failing on a shape mismatch.
+        n_pos = self.model.query_src_pos_embedding.num_embeddings
+        for key in (
+            'model.query_src_pos_embedding.weight',
+            'model.mask_src_pos_embedding.weight',
+        ):
+            if key in saved and saved[key].size(0) > n_pos:
+                print(
+                    f'{key}: checkpoint has {saved[key].size(0)} rows, model '
+                    f'{n_pos}; dropping the unused trailing rows.'
+                )
+                saved[key] = saved[key][:n_pos]
+
         current = self.state_dict()
         missing = [key for key in current if key not in saved]
         unexpected = [key for key in saved if key not in current]
@@ -572,16 +908,100 @@ class GeneQueryJEPATrainer(LightningModule):
         for key in missing:
             saved[key] = current[key]
 
-    def _quiz_kwargs(self) -> dict:
-        return {
-            'n_queries': self.n_queries,
-            'frac_shared': self.frac_shared,
-            'frac_tgt_only': self.frac_tgt_only,
-            'mask_frac_of_shared': (
-                self.mask_frac_of_shared if self.lambda_mask_ce > 0 else 0.0
+    # ------------------------------------------------------------------
+    # Quiz sampling helpers (shared by training, eval dump and KO paths).
+    # ------------------------------------------------------------------
+    def _set_nonsrc_gene_freq(self, table: torch.Tensor) -> None:
+        table = table.detach().float().clamp(min=0.0, max=1.0)
+        if table.dim() != 3:
+            raise ValueError(
+                'nonsrc_gene_freq must be (n_celltypes, n_total_tps + 1, LOCAL vocab), '
+                f'got shape {tuple(table.shape)}'
+            )
+        if self.nonsrc_celltypes and table.size(0) != len(self.nonsrc_celltypes):
+            raise ValueError(
+                f'nonsrc_gene_freq has {table.size(0)} cell-type rows but '
+                f'{len(self.nonsrc_celltypes)} names were given'
+            )
+        self.nonsrc_gene_freq = table
+
+    def _nonsrc_weights_for_batch(
+        self,
+        batch: dict,
+        time_step: int,
+        batch_size: int,
+        invert: bool = False,
+    ) -> Optional[torch.Tensor]:
+        """(B, V) sampling weights for non-source queries, or None = uniform.
+
+        weight = P(gene in target | cell type, time)^power + floor, or, with
+        ``invert=True``, (1 - P)^power + floor -- i.e. biased toward genes
+        the group usually does NOT express, for the "likely absent" draw.
+        Uses the batch's cell-type strings when present; otherwise the mean
+        over cell types. Never looks at the cell's own target sequence.
+        """
+        if self.query_sampling != 'source_blind' or self.nonsrc_gene_freq is None:
+            return None
+        table = self.nonsrc_gene_freq.detach().cpu()
+        t_index = min(int(time_step), table.size(1) - 1)
+        mean_row = table[:, t_index].mean(dim=0)                     # (V,)
+        names = batch.get(f'cell_type_harmonized_t{time_step}')
+        if names is None:
+            names = batch.get('cell_type_harmonized')
+        if names is None or len(names) != batch_size or not self._celltype_index:
+            rows = mean_row.unsqueeze(0).expand(batch_size, -1)
+        else:
+            index = torch.tensor(
+                [self._celltype_index.get(str(name), -1) for name in names],
+                dtype=torch.long,
+            )
+            rows = table[index.clamp(min=0), t_index]
+            rows = torch.where(
+                (index >= 0).unsqueeze(-1), rows, mean_row.unsqueeze(0).expand_as(rows)
+            )
+        if invert:
+            rows = 1.0 - rows.clamp(0.0, 1.0)
+        return rows.pow(self.nonsrc_weight_power) + self.nonsrc_weight_floor
+
+    def _sample_quiz(
+        self,
+        batch: dict,
+        time_step: int,
+        src_ids_global: torch.Tensor,
+        mask_frac: float,
+    ) -> Dict[str, torch.Tensor]:
+        batch_size = int(src_ids_global.size(0))
+        lowfreq_weights = None
+        if self.n_top_common_queries:
+            lowfreq_weights = self._nonsrc_weights_for_batch(
+                batch, time_step, batch_size, invert=True
+            )
+        return sample_query_batch(
+            src_input_ids_global=src_ids_global,
+            tgt_input_ids_local=batch[f'tgt_input_ids_t{time_step}'],
+            global_to_local=self.global_to_local,
+            all_gene_local_ids=self.all_gene_local_ids,
+            n_queries=self.n_queries,
+            frac_shared=self.frac_shared,
+            frac_tgt_only=self.frac_tgt_only,
+            mask_frac_of_shared=mask_frac,
+            rng=self.rng,
+            query_sampling=self.query_sampling,
+            n_src_queries=self.n_src_queries,
+            n_top_common_queries=self.n_top_common_queries or 0,
+            nonsrc_weights=self._nonsrc_weights_for_batch(
+                batch, time_step, batch_size
             ),
-            'rng': self.rng,
-        }
+            lowfreq_weights=lowfreq_weights,
+        )
+
+    @staticmethod
+    def _quiz_valid_mask(quiz: dict, like: torch.Tensor) -> torch.Tensor:
+        """``is_valid`` of a quiz dict; all-True for quizzes built without it."""
+        is_valid = quiz.get('is_valid')
+        if is_valid is None:
+            return torch.ones_like(like, dtype=torch.bool)
+        return is_valid.to(like.device)
 
     # ------------------------------------------------------------------
     # id-space conversion: LOCAL quiz ids -> whatever the encoder expects.
@@ -611,12 +1031,11 @@ class GeneQueryJEPATrainer(LightningModule):
         tgt_ids_local = batch[f'tgt_input_ids_t{time_step}']        # (B, Lt)
 
         # 1) Sample the quiz sheet (on CPU, plain Python).
-        quiz = sample_query_batch(
-            src_input_ids_global=src_ids_global,
-            tgt_input_ids_local=tgt_ids_local,
-            global_to_local=self.global_to_local,
-            all_gene_local_ids=self.all_gene_local_ids,
-            **self._quiz_kwargs(),
+        quiz = self._sample_quiz(
+            batch,
+            time_step,
+            src_ids_global,
+            mask_frac=self.mask_frac_of_shared if self.lambda_mask_ce > 0 else 0.0,
         )
         device = src_ids_global.device
         gene_ids_local = quiz['gene_ids_local'].to(device)          # (B, Q)
@@ -624,7 +1043,12 @@ class GeneQueryJEPATrainer(LightningModule):
         tgt_position = quiz['tgt_position'].to(device)              # (B, Q)
         src_position = quiz['src_position'].to(device)              # (B, Q)
         is_mask_ce = quiz['is_mask_ce'].to(device)                  # (B, Q)
-        gene_mask = is_present & ~is_mask_ce
+        is_valid = self._quiz_valid_mask(quiz, is_present)          # (B, Q)
+        # present -> regress to the true H_tgt row; absent -> regress to the
+        # fixed null. Mask-CE slots have no gene identity and take neither;
+        # filler slots (is_valid False) take nothing at all.
+        gene_mask = is_present & ~is_mask_ce & is_valid
+        absent_mask = ~is_present & ~is_mask_ce & is_valid
 
         src_for_encoder = self._src_ids_to_encoder_space(src_ids_global)
         if bool(is_mask_ce.any()):
@@ -653,11 +1077,16 @@ class GeneQueryJEPATrainer(LightningModule):
         per_query_distance = cosine_distance(
             out['z_hat_gene'], out['z_tgt_gene']
         )                                                           # (B, Q)
+        per_query_mse_loss = (z_hat_raw - z_tgt_raw).pow(2).mean(dim=-1)
         if self.gene_loss_type == 'mse':
-            per_query_mse_loss = (z_hat_raw - z_tgt_raw).pow(2).mean(dim=-1)
-            gene_loss = masked_mean(per_query_mse_loss, gene_mask)
+            per_query_gene_term = per_query_mse_loss
         else:
-            gene_loss = masked_mean(per_query_distance, gene_mask)
+            per_query_gene_term = per_query_distance
+        gene_loss = masked_mean(per_query_gene_term, gene_mask)
+        # Absent queries: z_tgt is already the fixed null (forward_one_timestep),
+        # so the very same distance pulls z_hat onto it. The null is a buffer:
+        # no gradient reaches it, only the predictor moves.
+        absent_loss = masked_mean(per_query_gene_term, absent_mask)
 
         # Cell loss: learned cell-query prediction vs encoder CLS (or mean).
         cell_loss = cosine_distance(
@@ -703,6 +1132,7 @@ class GeneQueryJEPATrainer(LightningModule):
 
         total_loss = (
             self.lambda_gene * gene_loss
+            + self.lambda_absent * absent_loss
             + self.lambda_cell * cell_loss
             + self.lambda_contrastive * contrastive_loss
             + self.lambda_mask_ce * mask_ce_loss
@@ -712,8 +1142,29 @@ class GeneQueryJEPATrainer(LightningModule):
 
         # 4) Honesty metrics (no gradients needed). --------------------------
         with torch.no_grad():
-            per_query_mse = (z_hat_raw - z_tgt_raw).pow(2).mean(dim=-1)
-            gene_mse = masked_mean(per_query_mse, gene_mask)
+            gene_mse = masked_mean(per_query_mse_loss, gene_mask)
+
+            # Absent diagnostics: how close do absent slots sit to the null,
+            # and do present slots stay away from it? (cosine, direction only)
+            null_direction = F.normalize(
+                self.model.absent_gene_embedding.to(z_hat_raw.dtype), dim=-1
+            )
+            cos_to_null = F.cosine_similarity(
+                z_hat_raw, null_direction.expand_as(z_hat_raw), dim=-1
+            )                                                       # (B, Q)
+            absent_cos_null = masked_mean(cos_to_null, absent_mask)
+            present_cos_null = masked_mean(cos_to_null, gene_mask)
+
+            # Quiz statistics: what the rank PE alone would tell the model.
+            # target sampler: p_present_neg ~0.82, p_present_pos = 1.0 (leak);
+            # source_blind: ~0.07 and ~0.62 = the data's own rates.
+            counted = is_valid & ~is_mask_ce
+            quiz_neg = counted & (src_position < 0)
+            quiz_pos = counted & (src_position >= 0)
+            present_f = is_present.to(z_hat_raw.dtype)
+            quiz_p_present_neg = masked_mean(present_f, quiz_neg)
+            quiz_p_present_pos = masked_mean(present_f, quiz_pos)
+            quiz_absent_frac = masked_mean(1.0 - present_f, counted)
 
             per_query_cosine = 1.0 - per_query_distance             # (B, Q)
             gene_cos_pred = masked_mean(per_query_cosine, gene_mask)
@@ -745,6 +1196,7 @@ class GeneQueryJEPATrainer(LightningModule):
         return {
             'total_loss': total_loss,
             'gene_loss': gene_loss,
+            'absent_loss': absent_loss,
             'cell_loss': cell_loss,
             'contrastive_loss': contrastive_loss,
             'mask_ce_loss': mask_ce_loss,
@@ -756,9 +1208,16 @@ class GeneQueryJEPATrainer(LightningModule):
             'gene_gap_vs_copy_src': gene_cos_pred_shared - gene_cos_copy_src,
             'cell_cos_pred': cell_cos_pred,
             'cell_gap_vs_copy_src': cell_cos_pred - cell_cos_copy_src,
+            'absent_cos_null': absent_cos_null,
+            'present_cos_null': present_cos_null,
+            'quiz_p_present_neg': quiz_p_present_neg,
+            'quiz_p_present_pos': quiz_p_present_pos,
+            'quiz_absent_frac': quiz_absent_frac,
             '_out': out,
             '_gene_ids_local': gene_ids_local,
             '_is_present': gene_mask,
+            '_absent_mask': absent_mask,
+            '_is_valid': is_valid,
             '_src_position': src_position,
         }
 
@@ -775,22 +1234,14 @@ class GeneQueryJEPATrainer(LightningModule):
         )
         tgt_ids_local = batch[f'tgt_input_ids_t{time_step}']
         if quiz is None:
-            quiz = sample_query_batch(
-                src_input_ids_global=src_ids_global,
-                tgt_input_ids_local=tgt_ids_local,
-                global_to_local=self.global_to_local,
-                all_gene_local_ids=self.all_gene_local_ids,
-                n_queries=self.n_queries,
-                frac_shared=self.frac_shared,
-                frac_tgt_only=self.frac_tgt_only,
-                mask_frac_of_shared=0.0,
-                rng=self.rng,
-            )
+            # Inference quiz: same sampler as training, mask-CE off.
+            quiz = self._sample_quiz(batch, time_step, src_ids_global, mask_frac=0.0)
         device = src_ids_global.device
         gene_ids_local = quiz['gene_ids_local'].to(device)
         is_present = quiz['is_present'].to(device)
         tgt_position = quiz['tgt_position'].to(device)
         src_position = quiz['src_position'].to(device)
+        is_valid = self._quiz_valid_mask(quiz, is_present)
         out = self.model.forward_one_timestep(
             src_input_ids=self._src_ids_to_encoder_space(src_ids_global),
             tgt_input_ids=self._local_ids_to_encoder_space(tgt_ids_local),
@@ -802,7 +1253,9 @@ class GeneQueryJEPATrainer(LightningModule):
         )
         return {
             '_out': out,
-            '_is_present': is_present,
+            '_is_present': is_present & is_valid,
+            '_absent_mask': ~is_present & is_valid,
+            '_is_valid': is_valid,
             '_quiz': quiz,
             '_gene_ids_local': gene_ids_local,
             '_src_position': src_position,
@@ -832,22 +1285,24 @@ class GeneQueryJEPATrainer(LightningModule):
 
         # Average each number over the timepoints and log it.
         keys_to_log = [
-            'total_loss', 'gene_loss', 'cell_loss', 'contrastive_loss',
-            'mask_ce_loss', 'vicreg_var', 'vicreg_cov', 'gene_mse',
-            'gene_cos_pred', 'gene_gap_vs_static', 'gene_gap_vs_copy_src',
-            'cell_cos_pred', 'cell_gap_vs_copy_src',
+            'total_loss', 'gene_loss', 'absent_loss', 'cell_loss',
+            'contrastive_loss', 'mask_ce_loss', 'vicreg_var', 'vicreg_cov',
+            'gene_mse', 'gene_cos_pred', 'gene_gap_vs_static',
+            'gene_gap_vs_copy_src', 'cell_cos_pred', 'cell_gap_vs_copy_src',
+            'absent_cos_null', 'present_cos_null',
+            'quiz_p_present_neg', 'quiz_p_present_pos', 'quiz_absent_frac',
         ]
         averaged = {}
         for key in keys_to_log:
             values = [r[key] for r in results_per_timestep]
             averaged[key] = torch.stack(values).mean()
         step_keys = {
-            'total_loss', 'gene_loss', 'mask_ce_loss', 'contrastive_loss',
-            'cell_loss', 'gene_mse',
+            'total_loss', 'gene_loss', 'absent_loss', 'mask_ce_loss',
+            'contrastive_loss', 'cell_loss', 'gene_mse',
         }
         bar_keys = {
-            'total_loss', 'gene_loss', 'mask_ce_loss', 'contrastive_loss',
-            'gene_gap_vs_copy_src',
+            'total_loss', 'gene_loss', 'absent_loss', 'mask_ce_loss',
+            'contrastive_loss', 'gene_gap_vs_copy_src', 'absent_cos_null',
         }
         for key, value in averaged.items():
             self.log(

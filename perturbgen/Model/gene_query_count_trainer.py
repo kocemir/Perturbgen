@@ -1,20 +1,14 @@
 """Count decoder on a frozen Gene-Query JEPA.
 
-Two input modes (``--count-input``):
-
-- ``source_only``: mean of *present* predicted gene embeddings ``z_hat_gene``.
-  Queries are the usual mixed 128-slot quiz (source cell only).
-- ``copy_target``: same predictor / ``z_hat`` path, but queries are the first
-  ``n_queries`` tokens of the true target sequence. Mean over unpadded slots
-  only (pad id 0). CLS is kept if it sits in that prefix.
-
-CountHead is the PerturbGen ZINB head. The cell_query slot is never used.
+One 128-query quiz per cell, then one vector. ``source_only`` runs the
+JEPA sampler (the checkpoint's own 128-slot quiz) and averages the
+present ``z_hat`` rows. ``copy_target`` quizzes the first ``n_queries``
+target tokens and averages the unpadded ones. PerturbGen's ``CountHead``
+maps that single (B, D) vector to all ``n_genes`` counts.
 
 In-silico KO (``--eval-count-ko``) replaces the gene in the source with
-``<mask>`` (id 1) by default; ``--ko-replace pad`` restores the old pad-slot
-edit. Optional ``resync_quiz`` recomputes query ``src_position`` from the
-edited source so knocked-out genes get the trained "absent from source"
-code (``-1``) instead of keeping the control rank.
+``<mask>`` (id 1) by default. Control and KO share the same 128 quiz;
+``--ko-resync-quiz`` refreshes source rank on the edited source.
 
 Train:
   python docs/examples/train_gene_query_jepa.py --train-count-decoder true \\
@@ -23,10 +17,12 @@ Train:
 
 from __future__ import annotations
 
+import pickle
 import random
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from pytorch_lightning import LightningModule
@@ -38,6 +34,7 @@ from perturbgen.Model.gene_query_jepa_trainer import (
     GeneQueryJEPATrainer,
 )
 from perturbgen.Modules.gene_query_jepa import PAD_TOKEN_ID
+from perturbgen.Modules.transformer import CountHead
 from perturbgen.src.jepa_token_maps import apply_id_lookup
 from perturbgen.src.metric import compute_emd
 
@@ -103,6 +100,72 @@ def first_target_prefix_quiz(
         'is_mask_ce': torch.zeros(
             batch_size, n_queries, dtype=torch.bool, device=device
         ),
+        # Pad slots are the only filler here; they are already not present.
+        'is_valid': is_present.clone(),
+    }
+
+
+def load_gene_panel(
+    vocab_path: str,
+    var_names: Sequence[str],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """LOCAL gene id for every column of a fixed h5ad gene panel.
+
+    ``vocab_path`` is this dataset's ``token_id_to_genename_*.pkl`` (written
+    at tokenisation time): LOCAL gene id -> ensembl id. We invert it and
+    look up every panel column by its ensembl id (``var_names``, in the
+    h5ad's own column order -- the order ``tgt_counts_t{t}`` tensors use).
+    Columns whose ensembl id has no LOCAL token (outside this run's
+    vocabulary -- e.g. ~140 of 2000 for the LPS 2k-HVG panel) get id 0 and
+    ``known=False``; the count decoder gives those a learned placeholder
+    embedding instead of a predictor row (see ``unknown_gene_embedding``).
+    """
+    with open(vocab_path, 'rb') as fh:
+        id_to_ensembl = pickle.load(fh)
+    ensembl_to_id = {str(v): int(k) for k, v in id_to_ensembl.items()}
+    found = [ensembl_to_id.get(str(name), -1) for name in var_names]
+    local_ids = torch.tensor(found, dtype=torch.long)
+    known = local_ids >= 0
+    return local_ids.clamp(min=0), known
+
+
+def full_panel_quiz(
+    src_input_ids_global: torch.Tensor,
+    global_to_local: torch.Tensor,
+    panel_local_ids: torch.Tensor,
+    pad_id: int = PAD_TOKEN_ID,
+) -> Dict[str, torch.Tensor]:
+    """Quiz over the FIXED count-head gene panel, in panel (column) order.
+
+    Every call recomputes ``src_position`` from whichever
+    ``src_input_ids_global`` is passed in, so a KO edit is reflected
+    immediately with no separate "resync" step: each gene's source
+    position is looked up by id, independently of the other genes, so
+    editing one token only ever changes that one gene's own row.
+
+    ``is_present`` / ``tgt_position`` are unused by
+    ``forward_one_timestep`` for computing ``z_hat_gene`` (they only drive
+    the ground-truth ``z_tgt_gene`` side, which the count decoder never
+    reads), so they're filled with harmless placeholders.
+    """
+    device = src_input_ids_global.device
+    batch_size = src_input_ids_global.size(0)
+    n_genes = panel_local_ids.size(0)
+    gene_ids = (
+        panel_local_ids.to(device=device, dtype=torch.long)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+    )
+    src_local = apply_id_lookup(src_input_ids_global, global_to_local)
+    src_position = _first_src_position(src_local, gene_ids, pad_id=int(pad_id))
+    filler = torch.zeros(batch_size, n_genes, dtype=torch.long, device=device)
+    return {
+        'gene_ids_local': gene_ids,
+        'is_present': torch.zeros(batch_size, n_genes, dtype=torch.bool, device=device),
+        'tgt_position': filler,
+        'src_position': src_position,
+        'is_mask_ce': torch.zeros(batch_size, n_genes, dtype=torch.bool, device=device),
+        'is_valid': torch.ones(batch_size, n_genes, dtype=torch.bool, device=device),
     }
 
 
@@ -110,6 +173,8 @@ class GeneQueryCountDecoderTrainer(LightningModule):
     def __init__(
         self,
         jepa_ckpt: str,
+        gene_panel_ensembl: Sequence[str],
+        vocab_path: str,
         n_genes: int = 2000,
         lr: float = 1e-3,
         weight_decay: float = 1e-3,
@@ -123,6 +188,12 @@ class GeneQueryCountDecoderTrainer(LightningModule):
         if count_input not in COUNT_INPUT_MODES:
             raise ValueError(
                 f'count_input must be one of {COUNT_INPUT_MODES}, got {count_input!r}'
+            )
+        if gene_panel_ensembl is not None and len(gene_panel_ensembl) != n_genes:
+            raise ValueError(
+                f'n_genes={n_genes} but gene_panel_ensembl has '
+                f'{len(gene_panel_ensembl)} entries -- these must match '
+                '(the panel IS the column order of tgt_counts_t{t}).'
             )
         self.save_hyperparameters(ignore=['jepa'])
         self.pred_tps = pred_tps if pred_tps is not None else [1, 2, 3]
@@ -144,8 +215,6 @@ class GeneQueryCountDecoderTrainer(LightningModule):
         self.jepa.vicreg_var_coeff = 0.0
         self.jepa.vicreg_cov_coeff = 0.0
 
-        from perturbgen.Modules.transformer import CountHead
-
         d_model = int(self.jepa.model.d_model)
         self.count_head = CountHead(
             loss_mode='zinb',
@@ -161,7 +230,8 @@ class GeneQueryCountDecoderTrainer(LightningModule):
         self.val_dict = {'pred_counts': [], 'true_counts': []}
         print(
             f'GeneQueryCountDecoder: n_genes={n_genes}, d_model={d_model}, '
-            f'count_input={count_input}, jepa_ckpt={jepa_ckpt}'
+            f'count_input={count_input} (128-quiz mean -> CountHead), '
+            f'n_queries={self.jepa.n_queries}, jepa_ckpt={jepa_ckpt}'
         )
 
     def _prefix_quiz(self, batch: dict, time_step: int) -> dict:
@@ -172,17 +242,27 @@ class GeneQueryCountDecoderTrainer(LightningModule):
             n_queries=int(self.jepa.n_queries),
         )
 
-    def _cell_vector(self, batch: dict, time_step: int) -> torch.Tensor:
-        if self.count_input == 'copy_target':
-            result = self.jepa.encode_one_timestep(
-                batch, time_step, quiz=self._prefix_quiz(batch, time_step)
-            )
-        else:
-            result = self.jepa._run_one_timestep(batch, time_step)
-        return present_gene_mean(
+    def _cell_vector(
+        self,
+        batch: dict,
+        time_step: int,
+        src_ids_global: Optional[torch.Tensor] = None,
+        quiz: Optional[dict] = None,
+    ) -> Tuple[torch.Tensor, dict]:
+        """Mean of the 128-quiz rows that are present. Returns (B, D) and the quiz."""
+        if self.count_input == 'copy_target' and quiz is None:
+            quiz = self._prefix_quiz(batch, time_step)
+        result = self.jepa.encode_one_timestep(
+            batch,
+            time_step,
+            quiz=quiz,
+            src_ids_global=src_ids_global,
+        )
+        z_cell = present_gene_mean(
             result['_out']['z_hat_gene'],
             result['_is_present'],
         )
+        return z_cell, result['_quiz']
 
     def setup(self, stage: Optional[str] = None) -> None:
         self.jepa.rng = random.Random(int(self.jepa.hparams.seed) + int(self.global_rank))
@@ -218,7 +298,7 @@ class GeneQueryCountDecoderTrainer(LightningModule):
                     f'missing tgt_counts_t{time_step}; count training needs h5ads'
                 )
             with torch.no_grad():
-                z_cell = self._cell_vector(batch, time_step)
+                z_cell, _ = self._cell_vector(batch, time_step)
             head_out = self.count_head(z_cell)
             size_factor = batch[f'tgt_size_factor_t{time_step}'].unsqueeze(1)
             mu = head_out['count_mean'] * size_factor.expand_as(head_out['count_mean'])
@@ -323,14 +403,12 @@ class GeneQueryCountDecoderTrainer(LightningModule):
     def on_validation_epoch_end(self):
         self._log_epoch_emd('val')
 
-    def _decode_present_mean(
+    def _decode_counts(
         self,
+        z_cell: torch.Tensor,
         batch: dict,
         time_step: int,
-        z_hat_gene: torch.Tensor,
-        is_present: torch.Tensor,
     ) -> torch.Tensor:
-        z_cell = present_gene_mean(z_hat_gene, is_present)
         head_out = self.count_head(z_cell)
         size_factor = batch[f'tgt_size_factor_t{time_step}'].unsqueeze(1)
         size_factor = size_factor.to(
@@ -343,25 +421,18 @@ class GeneQueryCountDecoderTrainer(LightningModule):
         quiz: dict,
         src_ids_global: torch.Tensor,
     ) -> dict:
-        """Keep the same gene questions; refresh ``src_position`` from ``src``.
-
-        After a source KO edit the knocked-out gene is no longer present as
-        itself, so ``_first_src_position`` returns ``-1`` (absent-from-source
-        PE). Gene ids / present mask / tgt ranks stay identical to control.
-        """
+        """Same 128 gene questions; refresh src_position after a source edit."""
         out = {
             key: (value.clone() if torch.is_tensor(value) else value)
             for key, value in quiz.items()
         }
-        # Lookup table may live on CPU while KO src is on GPU.
         src_local = apply_id_lookup(
             src_ids_global.detach().cpu(),
             self.jepa.global_to_local.detach().cpu(),
         )
-        gene_ids = out['gene_ids_local'].detach().cpu()
         out['src_position'] = _first_src_position(
             src_local,
-            gene_ids,
+            out['gene_ids_local'].detach().cpu(),
             pad_id=PAD_TOKEN_ID,
         ).to(device=src_ids_global.device)
         return out
@@ -377,11 +448,11 @@ class GeneQueryCountDecoderTrainer(LightningModule):
 
         Default ``replace_id`` is ``<mask>`` (1), same edit as MaskGIT
         ``perturbation_mode=mask``. Pass pad id 0 for the old "delete slot"
-        ablation. Quiz gene questions are taken from the control forward.
+        ablation.
 
-        If ``resync_quiz`` is True, KO reuses those questions but recomputes
-        ``src_position`` on the edited source (knocked-out gene -> ``-1``).
-        Default False keeps the old frozen-control-quiz behaviour.
+        Control and KO share one 128-quiz. ``resync_quiz`` recomputes
+        ``src_position`` on the edited source so the knocked-out gene is
+        absent (rank -1) instead of keeping the control rank.
         """
         src = batch['src_input_ids']
         keep = (src == int(gene_token_id)).any(dim=1)
@@ -401,30 +472,17 @@ class GeneQueryCountDecoderTrainer(LightningModule):
                     if self.count_input == 'copy_target'
                     else None
                 )
-                z_ctrl = self.jepa.encode_one_timestep(
-                    batch, time_step, quiz=quiz, src_ids_global=src
+                z_ctrl, quiz_ctrl = self._cell_vector(
+                    batch, time_step, src_ids_global=src, quiz=quiz
                 )
-                quiz_ko = z_ctrl['_quiz']
+                quiz_ko = quiz_ctrl
                 if resync_quiz:
                     quiz_ko = self._resync_quiz_src_position(quiz_ko, ko_src)
-                z_ko = self.jepa.encode_one_timestep(
-                    batch,
-                    time_step,
-                    quiz=quiz_ko,
-                    src_ids_global=ko_src,
+                z_ko, _ = self._cell_vector(
+                    batch, time_step, src_ids_global=ko_src, quiz=quiz_ko
                 )
-                control[time_step] = self._decode_present_mean(
-                    batch,
-                    time_step,
-                    z_ctrl['_out']['z_hat_gene'],
-                    z_ctrl['_is_present'],
-                )[keep]
-                perturbed[time_step] = self._decode_present_mean(
-                    batch,
-                    time_step,
-                    z_ko['_out']['z_hat_gene'],
-                    z_ko['_is_present'],
-                )[keep]
+                control[time_step] = self._decode_counts(z_ctrl, batch, time_step)[keep]
+                perturbed[time_step] = self._decode_counts(z_ko, batch, time_step)[keep]
                 true[time_step] = batch[f'tgt_counts_t{time_step}'].to(
                     control[time_step].device, dtype=control[time_step].dtype
                 )[keep]

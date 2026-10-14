@@ -164,6 +164,9 @@ docs/examples/jepa_toy_res/*/
 docs/examples/ko_comparison_res/
 docs/examples/ko_comparison_res_*/
 
+# Parse 10M myeloid DEG table (~200 MB; download separately, see external/parse10m/README.md)
+docs/examples/external/parse10m/*.parquet
+
 # Ad-hoc analysis tables
 docs/examples/collapse_check*.csv
 

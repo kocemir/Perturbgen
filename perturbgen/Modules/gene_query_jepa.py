@@ -19,10 +19,14 @@ This model keeps the gene axis. The predictor is asked, gene by gene:
      Tell me what that gene's contextual embedding will look like at
      the target time."
 
-Queries are three kinds per cell:
-      ~40%  genes present in BOTH source and target   (shared — shift)
-      ~50%  genes present ONLY in the target           (induced)
-      ~10%  genes absent from the target               (placeholder; no loss)
+Queries per cell (see ``sample_query_batch`` in the trainer):
+  query_sampling='source_blind' (default for new runs): genes are picked
+      WITHOUT looking at the target — ~75% from the source cell, ~25% from
+      genes the source does not express. Only afterwards the target decides
+      the label: present (true gene row of H_tgt) or absent (fixed null
+      vector, trained with ``lambda_absent``).
+  query_sampling='target' (legacy): ~40% shared / ~50% target-only /
+      ~10% absent decoys, chosen from the target's own gene list.
 
 THE PICTURE
 -----------
@@ -270,13 +274,19 @@ class GeneQueryJEPA(nn.Module):
         )
 
         # ------------------------------------------------------------------
-        # 3) The learned "this gene is absent" answer. When we query a gene
+        # 3) The FIXED "this gene is absent" answer. When we query a gene
         #    that is NOT expressed at the target time, the correct answer is
-        #    this vector.
+        #    this vector. It is a frozen buffer, not a parameter: a target
+        #    that also learns would drift towards the predictor's mean output
+        #    and erase the present/absent separation (same reason the EMA
+        #    encoder is stop-grad). Random direction = nearly orthogonal to
+        #    every gene embedding, so it is only reached on purpose. Norm =
+        #    sqrt(d_model), the natural scale of a LayerNorm output, which is
+        #    what the predictor emits and what raw-MSE compares against.
         # ------------------------------------------------------------------
-        self.absent_gene_embedding = nn.Parameter(
-            torch.randn(self.d_model) * 0.02
-        )
+        absent = torch.randn(self.d_model)
+        absent = absent / absent.norm().clamp(min=1e-6) * (self.d_model ** 0.5)
+        self.register_buffer('absent_gene_embedding', absent)
         # Extra predictor query (not a gene LUT row, not encoder token id 2).
         self.cell_query = nn.Parameter(torch.randn(1, 1, self.d_model) * 0.02)
         # Mask-CE query: no gene identity; shares the src-rank table below.
