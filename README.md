@@ -3,6 +3,8 @@
 
 # PerturbGen foundation model for dynamic cellular states
 
+**Gene-Query JEPA:** start here → [docs/GENE_QUERY.md](docs/GENE_QUERY.md)
+
 ![PerturbGen overview](docs/architecture.png)
 
 A major challenge in biology is predicting how cells transition between states over time and how perturbations disrupt these transitions. Although recent approaches can predict single-cell perturbation responses in silico, they cannot predict responses across dynamic cell trajectories—for example, how early perturbations reconfigure later cell states. **PerturbGen** is a generative foundation model trained on over 100 million single-cell transcriptomes that predicts perturbation responses along cellular trajectories. It predicts how genetic perturbation at a source state shapes downstream states, alters gene programs, and modifies trajectories across time (e.g., in differentiation or disease progression).
@@ -102,8 +104,6 @@ For usage, see the [documentation](https://perturbgen.cog.sanger.ac.uk/docs/exam
 - [Gene Program Discovery](docs/examples/05_GeneProgram_Discovery.ipynb)
 - [Perturbation](docs/examples/06_perturbation.ipynb)
 - [Post Perturbation Analyses](docs/examples/07_PostPerturbation_Analyses.ipynb)
-
-**Gene-Query JEPA (this fork).** Architecture, loss, count head, and what each notebook does: [docs/GENE_QUERY.md](docs/GENE_QUERY.md). Commands: [docs/examples/GENE_QUERY_JEPA.md](docs/examples/GENE_QUERY_JEPA.md).
 
 ## Documentation
 
