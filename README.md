@@ -103,22 +103,7 @@ For usage, see the [documentation](https://perturbgen.cog.sanger.ac.uk/docs/exam
 - [Perturbation](docs/examples/06_perturbation.ipynb)
 - [Post Perturbation Analyses](docs/examples/07_PostPerturbation_Analyses.ipynb)
 
-**Gene-Query JEPA (this fork).** Encoder + predictor trained on LPS, then a pooled count head. In-silico IL1B knockout at 90 min is compared with MaskGIT and with an external IL-1β stimulation screen.
-
-| What | Where |
-|---|---|
-| Train JEPA / count head / KO | `docs/examples/train_gene_query_jepa.py` |
-| Embedding UMAPs (one atlas checkpoint) | `docs/examples/08_GeneQuery_JEPA_Embedding_Analysis.ipynb` |
-| MaskGIT post-perturbation (panel e style) | `docs/examples/07_PostPerturbation_Analyses.ipynb` |
-| MaskGIT vs two JEPA KOs (effects, panel f, panel i) | `docs/examples/KO_comparison.ipynb` |
-| Pathway mirror vs Parse IL-1β | `docs/examples/panel_i_pathway_mirror.py` |
-| Training curves for the kept runs | `docs/examples/jepa_full_res/plot_full_jepa_curves.py` |
-| What is kept on disk | `docs/examples/KEEP.md` |
-| Architecture figures | `docs/qj_architecture/` |
-
-Details and commands: [docs/examples/GENE_QUERY_JEPA.md](docs/examples/GENE_QUERY_JEPA.md).
-
-Checkpoints, KO `.h5ad` dumps, and the Parse DEG table are **not** in git (size). Panel i needs `docs/examples/external/parse10m/degs_myeloid.parquet` (see that folder’s README). Figure outputs under `ko_comparison_res_*` and `jepa_full_res/*/` are local and gitignored.
+**Gene-Query JEPA (this fork).** Architecture, loss, count head, and what each notebook does: [docs/GENE_QUERY.md](docs/GENE_QUERY.md). Commands: [docs/examples/GENE_QUERY_JEPA.md](docs/examples/GENE_QUERY_JEPA.md).
 
 ## Documentation
 

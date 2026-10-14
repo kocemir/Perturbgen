@@ -1,5 +1,7 @@
 # Gene-Query JEPA (LPS)
 
+The model, the figures, and what each notebook does: [../GENE_QUERY.md](../GENE_QUERY.md).
+
 One script trains the JEPA, trains the pooled count head, dumps embeddings, and runs an IL1B knockout.
 
 From `Perturbgen/` with the Poetry env and `PYTHONPATH` set:
