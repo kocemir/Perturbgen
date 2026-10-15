@@ -133,7 +133,15 @@ The line we compare with MaskGIT draws the 128 questions as:
 - 48 genes that are **not** in the source, chosen as the most common at that cell type and time,
 - 16 weighted-random from the rest, biased toward genes that are usually off.
 
-Its contrastive weight is 0. The count head on top of it is the pooled head above, trained for 25 epochs (`20261013_172837`, best validation MSE 5.18 at epoch 22). The JEPA checkpoint under it is `20261012_160033`.
+![Query, qsb64/tc48 knockout line. 64 source / 48 deterministic top-common / 16 weighted-random, rank table unchanged, target time table shrunk to 6 h/10 h.](qj_architecture/gene_query_jepa_query_src90m_qsb64tc48.png)
+
+Its contrastive weight is 0, so *L*_NCE drops out of the loss entirely:
+
+![Loss, qsb64/tc48 knockout line. Same L_var/L_abs/L_mask as the atlas config; L_NCE shown struck out at weight 0.](qj_architecture/gene_query_jepa_loss_src90m_qsb64tc48.png)
+
+The full step-by-step derivation of both diagrams — the population-prior weights behind the top-common pool, the rank/identity/time construction, and the per-term loss definitions — is in [`qj_architecture/gene_query_jepa_winning_config_notation.md`](qj_architecture/gene_query_jepa_winning_config_notation.md). That document also carries the one-line reasoning for each of the three numbers that changed from the atlas config above: 96→64 source questions, the new 48-slot top-common pool, and dropping *L*_NCE.
+
+The count head on top of it is the pooled head above, trained for 25 epochs (`20261013_172837`, best validation MSE 5.18 at epoch 22). The JEPA checkpoint under it is `20261012_160033`.
 
 An older source-blind line (96 source questions, no top-common block, JEPA `20261001_143041`, count head `20261001_202210`) is kept as the second JEPA column.
 
