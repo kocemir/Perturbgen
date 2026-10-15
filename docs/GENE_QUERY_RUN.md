@@ -358,4 +358,31 @@ The h5ad in that directory has:
 | `layers['true_counts']` | Measured target counts |
 | `layers['pert_counts']` | Same matrix as `X` |
 
-`KO_comparison.ipynb` and notebook 07 read this layout. Notebook 07 is the MaskGIT dump; point it at a MaskGIT h5ad, not this one.
+`KO_comparison.ipynb` does not run this command. `RERUN_INFERENCE` stays `False`, and the notebook opens whatever path is written in the YAML. Section 6 produces the h5ad. The YAML is only the pointer the notebook and `panel_i_pathway_mirror.py` follow.
+
+The files in the repo still point at this server's sod2 tree. On another machine, after the dump finishes, edit them to the paths you just wrote. The same absolute path is copied in more than one place; changing only `cli.args` leaves the notebook on the old file.
+
+`docs/examples/configs/ko/comparison.yaml`
+
+| Field | Set it to |
+|---|---|
+| `maps.token_id_to_ensembl` | `$SRC90/token_id_to_genename_2000_hvg.pkl` |
+| `maps.symbol_to_ensembl` | a Geneformer `gene_name_id_dict.pkl`, if you have one. Missing symbols do not block the dump |
+| `output_dir` | where the comparison figures should be written |
+
+`docs/examples/configs/ko/jepa_count_il1b_src_90m_qsb64_tc48_count25_mask.yaml`
+
+| Field | Set it to |
+|---|---|
+| `data.tokenized`, `data.src_dataset_file`, `data.tgt_dataset_folder`, `data.src_adata`, `data.tgt_adata_folder` | the `$SRC90` tree from section 1 |
+| `trainer.output_dir` | `$LPS_DATA/res/ko_il1b` |
+| `trainer.mapping_dict_path`, `trainer.tokenid_to_rowid_path` | the two pickles in `$SRC90` |
+| `model.jepa_ckpt` | the section 5 `*-last.ckpt` |
+| `model.count_ckpt` | the count-head `*-last.ckpt` |
+| `cli.args` | the same command as section 6, with those paths |
+
+That YAML has no `preferred_dump`. The notebook takes the newest file under `trainer.output_dir` matching `dump_glob` (`*_ssrc_*qresync.h5ad`). A mask + quiz-resync dump is named `..._ssrc_kmask_qresync.h5ad`, so the glob matches. If you set `preferred_dump`, it must be that filename or the notebook ignores the new file and keeps the pinned one.
+
+The older source-blind column is `jepa_count_il1b_src_90m_sourceblind_srconly_mask.yaml`. Same fields, its own checkpoints.
+
+MaskGIT does not use `train_gene_query_jepa.py`. Its YAML is `configs/ko/maskgit_il1b_src_90m.yaml`, and the run command in that file's header is `perturbgen/Perturb/val.py --config` that YAML. `experiment.preferred_dump` is set there, so a new MaskGIT h5ad stays unused until that filename is updated. Notebook 07 reads the MaskGIT directory only.
