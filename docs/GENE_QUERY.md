@@ -169,6 +169,14 @@ Panel i is also a script: [`examples/panel_i_pathway_mirror.py`](examples/panel_
 
 Training curves for the four kept runs: [`examples/jepa_full_res/plot_full_jepa_curves.py`](examples/jepa_full_res/plot_full_jepa_curves.py). Which checkpoints and dumps are still on disk: [`examples/KEEP.md`](examples/KEEP.md).
 
+The ten checkpoints used in these experiments are collected on the lab sod2 mount, not in git:
+
+```
+/mnt/sod2-project/csb4/stuke1/perturbgen_keep
+```
+
+`jepa/` holds the four JEPA runs (atlas notebook 08, normal → 90 min / 6 h / 10 h, 90 min source-blind, 90 min qsb64). `jepa_count/` holds the two count heads. `maskgit/` holds the resting mask and count checkpoints and the 90 min mask and IL1B count checkpoints. Copies of the training-directory originals.
+
 ## Requirements
 
 Python 3.11. From the repository root:

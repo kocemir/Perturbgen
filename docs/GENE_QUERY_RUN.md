@@ -11,6 +11,8 @@ source "$(poetry env info -p)/bin/activate"
 
 What each stage is, and why the two datasets are separate, is in [GENE_QUERY.md](GENE_QUERY.md).
 
+The checkpoints from the runs already trained for these experiments are at `/mnt/sod2-project/csb4/stuke1/perturbgen_keep` (`jepa/`, `jepa_count/`, `maskgit/`). They are on the lab sod2 mount, not in git. The commands below train new ones under `$LPS_DATA`.
+
 ## 0. Paths for this shell
 
 `LPS_DATA` is where tokenization writes. The training script does not follow it on its own: every training and dump command below passes `--tokenized`, `--split-path`, and `--output-dir`. Without those, the script looks for this server's `/mnt/sod2-project/...` tree.

@@ -2,6 +2,14 @@
 
 **Status: cleanup applied 2026-10-14.** Log: `cleanup_deleted_20261014.log`.
 
+The ten checkpoints used in the experiments are also copied, one file per run, at:
+
+```
+/mnt/sod2-project/csb4/stuke1/perturbgen_keep
+```
+
+`jepa/`, `jepa_count/`, and `maskgit/`. The paths below are the training-directory originals; those stay in place.
+
 Rule: if it is not named below, it was treated as delete-candidate.
 
 ## Notebook 08 (embedding / gene programs)
