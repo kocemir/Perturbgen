@@ -95,101 +95,16 @@ Each command writes under `$LPS_DATA/tokenized_data/<dataset>/`:
 
 On the 90 min corpus, `1_6h_LPS` and `2_10h_LPS` mean `--pred-tps 1,2` is 6 h and 10 h. On the atlas, `1,2,3` is 90 min, 6 h, and 10 h. The index is the slot this tokenization created, not a universal clock.
 
-## 2. Freeze the split
+## 2. Split
 
-Tokenization does not write the split. The training script does not compute one either: `--split true` only reads a pickle of row numbers. The block below is the same recipe as notebook 02. It writes the pickle next to the data it just tokenized. Another machine's pickle will not match these rows.
+`tokenise` does not write a `splits/` folder. To create the split and to look at validation scores, run [02_tokenization_pairing.ipynb](examples/02_tokenization_pairing.ipynb). Part A writes the atlas pickle, Part B the 90 min pickle, each next to the data it tokenized.
 
-Resting atlas, one row at a time, stratified on `cell_type_harmonized`, seed 42, 90% train / 10% val:
+Training then takes `--split true` and `--split-path` pointing at that pickle file, not at the folder:
 
-```bash
-TOK="$ATLAS" GROUP_BY_SOURCE=0 python - <<'PY'
-import datetime, os, pickle
-from pathlib import Path
-import anndata as ad
-import numpy as np
-from perturbgen.src.utils import stratified_split
+- Atlas: `$ATLAS/splits/stratified_cell_type_harmonized_seed42_90_10.pkl`
+- 90 min: `$SRC90/splits/stratified_cell_type_harmonized_srcgroup_seed42_90_10.pkl`
 
-root = Path(os.environ["TOK"])
-group = os.environ.get("GROUP_BY_SOURCE", "0") == "1"
-tgt = sorted((root / "h5ad_pairing_2000_hvg_tgt").glob("*.h5ad"))[0]
-adata = ad.read_h5ad(tgt)
-obs = ["cell_type_harmonized"]
-if group:
-    dedup = adata.obs.drop_duplicates("cell_pairing_index").reset_index(drop=True)
-    dedup_ad = ad.AnnData(X=np.zeros((len(dedup), 1), np.float32), obs=dedup)
-    tr, va, te = stratified_split(dedup_ad, 0.9, 0.0, obs, seed=42)
-    pairs = dedup["cell_pairing_index"].to_numpy()
-    all_pairs = adata.obs["cell_pairing_index"].to_numpy()
-    train = np.where(np.isin(all_pairs, pairs[list(tr)]))[0].astype(np.int64)
-    val = np.where(np.isin(all_pairs, pairs[list(va)]))[0].astype(np.int64)
-    test = np.where(np.isin(all_pairs, pairs[list(te)]))[0].astype(np.int64)
-    stem = "stratified_cell_type_harmonized_srcgroup_seed42_90_10"
-else:
-    tr, va, te = stratified_split(adata, 0.9, 0.0, obs, seed=42)
-    train, val, test = (np.asarray(x, np.int64) for x in (tr, va, te))
-    stem = "stratified_cell_type_harmonized_seed42_90_10"
-out = root / "splits"
-out.mkdir(parents=True, exist_ok=True)
-path = out / f"{stem}.pkl"
-with path.open("wb") as handle:
-    pickle.dump({
-        "train_indices": train, "val_indices": val, "test_indices": test,
-        "seed": 42, "train_prop": 0.9, "test_prop": 0.0,
-        "group_by_source": group, "n_rows": int(adata.n_obs),
-        "reference_h5ad": str(tgt),
-        "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    }, handle, protocol=pickle.HIGHEST_PROTOCOL)
-print(path)
-print("train", len(train), "val", len(val), "test", len(test))
-PY
-```
-
-90 min corpus. The same source cell is repeated across many target rows, so the split is grouped by `cell_pairing_index`: a source cell is entirely in train or entirely in val.
-
-```bash
-TOK="$SRC90" GROUP_BY_SOURCE=1 python - <<'PY'
-import datetime, os, pickle
-from pathlib import Path
-import anndata as ad
-import numpy as np
-from perturbgen.src.utils import stratified_split
-
-root = Path(os.environ["TOK"])
-group = os.environ.get("GROUP_BY_SOURCE", "0") == "1"
-tgt = sorted((root / "h5ad_pairing_2000_hvg_tgt").glob("*.h5ad"))[0]
-adata = ad.read_h5ad(tgt)
-obs = ["cell_type_harmonized"]
-if group:
-    dedup = adata.obs.drop_duplicates("cell_pairing_index").reset_index(drop=True)
-    dedup_ad = ad.AnnData(X=np.zeros((len(dedup), 1), np.float32), obs=dedup)
-    tr, va, te = stratified_split(dedup_ad, 0.9, 0.0, obs, seed=42)
-    pairs = dedup["cell_pairing_index"].to_numpy()
-    all_pairs = adata.obs["cell_pairing_index"].to_numpy()
-    train = np.where(np.isin(all_pairs, pairs[list(tr)]))[0].astype(np.int64)
-    val = np.where(np.isin(all_pairs, pairs[list(va)]))[0].astype(np.int64)
-    test = np.where(np.isin(all_pairs, pairs[list(te)]))[0].astype(np.int64)
-    stem = "stratified_cell_type_harmonized_srcgroup_seed42_90_10"
-else:
-    tr, va, te = stratified_split(adata, 0.9, 0.0, obs, seed=42)
-    train, val, test = (np.asarray(x, np.int64) for x in (tr, va, te))
-    stem = "stratified_cell_type_harmonized_seed42_90_10"
-out = root / "splits"
-out.mkdir(parents=True, exist_ok=True)
-path = out / f"{stem}.pkl"
-with path.open("wb") as handle:
-    pickle.dump({
-        "train_indices": train, "val_indices": val, "test_indices": test,
-        "seed": 42, "train_prop": 0.9, "test_prop": 0.0,
-        "group_by_source": group, "n_rows": int(adata.n_obs),
-        "reference_h5ad": str(tgt),
-        "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    }, handle, protocol=pickle.HIGHEST_PROTOCOL)
-print(path)
-print("train", len(train), "val", len(val), "test", len(test))
-PY
-```
-
-Leaving `--split-path` off does not build this file. The flag then points at the atlas pickle baked into the script, and a 90 min run stops before training.
+Omitting `--split-path` does not build the file. The flag falls back to the atlas pickle baked into the script, and a 90 min run stops before training.
 
 ## 3. Train the resting JEPA
 
