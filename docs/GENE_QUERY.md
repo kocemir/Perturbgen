@@ -8,6 +8,8 @@ A second stage, trained after the JEPA is frozen, turns those predicted embeddin
 
 The figures below are the **normal → 90 min / 6 h / 10 h** model (notebook 08). The IL1B knockout line uses the same blocks with a different quiz; that difference is in [The knockout line](#the-knockout-line).
 
+To run tokenization, both trainings, the embedding dump, and the IL1B knockout from the shell, use [GENE_QUERY_RUN.md](GENE_QUERY_RUN.md).
+
 ![Overview. Source cell, query, predictor, EMA target, and the four loss terms.](qj_architecture/gene_query_jepa_architecture_v3.png)
 
 ## What a training step is

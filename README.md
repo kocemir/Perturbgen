@@ -3,7 +3,7 @@
 
 # PerturbGen foundation model for dynamic cellular states
 
-**Gene-Query JEPA:** start here → [docs/GENE_QUERY.md](docs/GENE_QUERY.md)
+**Gene-Query JEPA:** start here → [docs/GENE_QUERY.md](docs/GENE_QUERY.md). Commands after the venv is installed → [docs/GENE_QUERY_RUN.md](docs/GENE_QUERY_RUN.md).
 
 ![PerturbGen overview](docs/architecture.png)
 
